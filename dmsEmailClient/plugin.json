@@ -1,0 +1,20 @@
+{
+    "id": "dmsEmailClient",
+    "name": "DMS Email Client",
+    "description": "High-performance email checker and notifier using Rust",
+    "version": "1.0.0",
+    "author": "gmaaa",
+    "icon": "mail",
+    "type": "widget",
+    "capabilities": [
+        "dankbar-widget"
+    ],
+    "component": "./DmsEmailClientWidget.qml",
+    "settings": "./DmsEmailClientSettings.qml",
+    "permissions": [
+        "settings_read",
+        "settings_write",
+        "process"
+    ],
+    "requires_dms": ">=1.4.0"
+}

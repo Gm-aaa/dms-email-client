@@ -1,0 +1,909 @@
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import qs.Common
+import qs.Services
+import qs.Widgets
+import qs.Modules.Plugins
+
+PluginComponent {
+    id: root
+
+    // Settings from pluginData
+    readonly property int refreshInterval: (pluginData && pluginData.refreshInterval) ? pluginData.refreshInterval : 10
+    readonly property int maxMailsShown: (pluginData && pluginData.maxMailsShown) ? pluginData.maxMailsShown : 5
+
+    // Popout configurations
+    popoutWidth: 320
+    popoutHeight: (pluginData && pluginData.popoutHeight) ? pluginData.popoutHeight : 380
+
+    // Rust 二进制（守护进程 + CLI）。默认按名字从 PATH 查找（需先 `cargo install --path .`
+    // 或把 dms-email-client 放进 PATH）。如需指定绝对路径，改这一处即可。
+    readonly property string binPath: "dms-email-client"
+
+    // Data states
+    // unreadMails 现在同时包含已读与未读邮件（已读的 seen=true，仅不显示红点）
+    property var unreadMails: []
+    // 邮件总数（含已读）→ 控制列表是否显示
+    readonly property int totalCount: root.unreadMails.length
+    // 真正未读的数量（seen=false）→ 角标、标题、一键已读按钮
+    readonly property int unreadCount: {
+        let n = 0;
+        for (let i = 0; i < root.unreadMails.length; i++)
+            if (!root.unreadMails[i].seen) n++;
+        return n;
+    }
+    property string lastUpdate: ""
+    property string errorMessage: ""
+
+    // Account filter for the list ("" = all accounts)
+    property string accountFilter: ""
+    readonly property var accountNames: {
+        let s = [];
+        for (let i = 0; i < root.unreadMails.length; i++) {
+            let a = root.unreadMails[i].account;
+            if (a && s.indexOf(a) < 0)
+                s.push(a);
+        }
+        return s;
+    }
+    readonly property var filteredMails: root.accountFilter === ""
+        ? root.unreadMails
+        : root.unreadMails.filter(function(m) { return m.account === root.accountFilter; })
+
+    // 数据变化后，若当前筛选的账户已没有未读邮件（如刚被一键已读），自动回到「全部」，
+    // 否则筛选 chip 在只剩一个账户时会隐藏，导致列表看起来空了。
+    onUnreadMailsChanged: {
+        if (root.accountFilter !== "" && root.accountNames.indexOf(root.accountFilter) < 0)
+            root.accountFilter = "";
+    }
+
+    // Detail-view state (set when a mail is opened)
+    property var selectedMail: null
+    property bool detailLoading: false
+    property string detailError: ""
+    property string detailFrom: ""
+    property string detailSubject: ""
+    property string detailDate: ""
+    property string detailBody: ""
+
+    function openMail(mail) {
+        root.selectedMail = mail;
+        root.detailLoading = true;
+        root.detailError = "";
+        root.detailFrom = mail.from || "";
+        root.detailSubject = mail.subject || "";
+        root.detailDate = mail.date || "";
+        root.detailBody = "";
+        bodyProcess.aAccount = mail.account;
+        bodyProcess.aFolder = mail.folder || "INBOX";
+        bodyProcess.aUid = String(mail.uid);
+        bodyProcess.running = true;
+    }
+
+    function closeMail() {
+        root.selectedMail = null;
+    }
+
+    function markSelectedRead() {
+        if (!root.selectedMail)
+            return;
+        readProcess.aAccount = root.selectedMail.account;
+        readProcess.aFolder = root.selectedMail.folder || "INBOX";
+        readProcess.aUid = String(root.selectedMail.uid);
+        readProcess.running = true;
+    }
+
+    // 一键已读：把当前筛选（accountFilter，空=全部）下的未读全部标为已读
+    function markAllRead() {
+        if (root.unreadCount === 0)
+            return;
+        readAllProcess.aAccount = root.accountFilter;
+        readAllProcess.running = false;
+        readAllProcess.running = true;
+    }
+
+    // ── 轻量剪贴板提示（在弹出面板内短暂显示） ──
+    property string toastText: ""
+    Timer {
+        id: toastTimer
+        interval: 1600
+        onTriggered: root.toastText = ""
+    }
+    function showToast(msg) {
+        root.toastText = msg;
+        toastTimer.restart();
+    }
+
+    function copyToClipboard(text) {
+        clipProcess.payload = text;
+        clipProcess.running = false;
+        clipProcess.running = true;
+    }
+    function openExternal(url) {
+        openProcess.url = url;
+        openProcess.running = false;
+        openProcess.running = true;
+    }
+
+    // Fetch the full body of a selected mail
+    Process {
+        id: bodyProcess
+        property string aAccount: ""
+        property string aFolder: ""
+        property string aUid: ""
+        command: [root.binPath, "body", aAccount, aFolder, aUid]
+        running: false
+        stdout: StdioCollector {
+            onStreamFinished: {
+                root.detailLoading = false;
+                try {
+                    let d = JSON.parse(this.text);
+                    if (d.ok) {
+                        root.detailFrom = d.from || root.detailFrom;
+                        root.detailSubject = d.subject || root.detailSubject;
+                        root.detailDate = d.date || root.detailDate;
+                        root.detailBody = d.body || "(无正文)";
+                        root.detailError = "";
+                    } else {
+                        root.detailError = d.error || "加载失败";
+                    }
+                } catch (e) {
+                    root.detailError = "解析失败";
+                }
+            }
+        }
+    }
+
+    // Mark a selected mail as read
+    Process {
+        id: readProcess
+        property string aAccount: ""
+        property string aFolder: ""
+        property string aUid: ""
+        command: [root.binPath, "read", aAccount, aFolder, aUid]
+        running: false
+        stdout: StdioCollector {
+            onStreamFinished: {
+                try {
+                    let d = JSON.parse(this.text);
+                    if (d.ok) {
+                        // 乐观地把这封置为已读（保留在列表，仅去红点），再回查同步。
+                        // 按 account+folder+uid 匹配（UID 是按文件夹的）。
+                        if (root.selectedMail) {
+                            let uid = root.selectedMail.uid;
+                            let acc = root.selectedMail.account;
+                            let fld = root.selectedMail.folder || "INBOX";
+                            root.unreadMails = root.unreadMails.map(function(m) {
+                                if (m.uid === uid && m.account === acc && (m.folder || "INBOX") === fld)
+                                    return Object.assign({}, m, { seen: true });
+                                return m;
+                            });
+                        }
+                        root.closeMail();
+                        statusProcess.running = true;
+                    }
+                } catch (e) {}
+            }
+        }
+    }
+
+    // Mark all currently-listed mails (optionally filtered by account) as read
+    Process {
+        id: readAllProcess
+        property string aAccount: ""
+        command: [root.binPath, "read-all", aAccount]
+        running: false
+        stdout: StdioCollector {
+            onStreamFinished: {
+                try {
+                    let d = JSON.parse(this.text);
+                    if (d.ok) {
+                        // 乐观地把已标记账户的邮件全部置为已读（保留在列表，仅去红点），再回查同步
+                        let acc = readAllProcess.aAccount;
+                        root.unreadMails = root.unreadMails.map(function(m) {
+                            if (acc === "" || m.account === acc)
+                                return Object.assign({}, m, { seen: true });
+                            return m;
+                        });
+                        root.showToast("已全部标记已读（" + (d.marked || 0) + " 封）");
+                        statusProcess.running = true;
+                    } else {
+                        root.showToast("标记失败：" + (d.error || ""));
+                    }
+                } catch (e) {}
+            }
+        }
+    }
+
+    // 复制到剪贴板（wl-copy）
+    Process {
+        id: clipProcess
+        property string payload: ""
+        command: ["wl-copy", payload]
+        running: false
+        onRunningChanged: {
+            if (!running && payload !== "")
+                root.showToast("已复制：" + payload);
+        }
+    }
+
+    // 用默认程序打开链接（xdg-open）
+    Process {
+        id: openProcess
+        property string url: ""
+        command: ["xdg-open", url]
+        running: false
+    }
+
+    // ── Daemon lifecycle ──
+    // The daemon runs for as long as this widget (i.e. the enabled plugin) lives.
+    // Quickshell terminates the process when the component is destroyed, so the
+    // daemon is automatically started when the plugin is enabled and stopped when
+    // it is disabled/removed. The status poll below also restarts it if it dies.
+    Process {
+        id: daemonProcess
+        command: [root.binPath, "daemon"]
+        running: false
+    }
+
+    Component.onCompleted: {
+        daemonProcess.running = true;
+    }
+
+    // The daemon needs a moment to bind its IPC socket on first launch; poll again
+    // shortly after startup so the "Daemon not running" state clears quickly.
+    Timer {
+        id: startupPoll
+        interval: 1500
+        running: true
+        repeat: false
+        onTriggered: statusProcess.running = true
+    }
+
+    // Refresh on an interval
+    Timer {
+        id: refreshTimer
+        interval: root.refreshInterval * 1000
+        running: true
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: {
+            statusProcess.running = true;
+        }
+    }
+
+    Process {
+        id: statusProcess
+        command: [root.binPath, "status"]
+        running: false
+
+        stdout: StdioCollector {
+            onStreamFinished: {
+                try {
+                    let data = JSON.parse(this.text);
+                    if (data.error) {
+                        // CLI-level error (e.g. daemon not running)
+                        root.errorMessage = data.error;
+                        root.unreadMails = [];
+                        // Self-heal: (re)start the daemon if it is not running
+                        // (e.g. first launch, a crash, or a config-change restart).
+                        if (!daemonProcess.running) {
+                            daemonProcess.running = true;
+                        }
+                    } else {
+                        root.unreadMails = data.unread_mails || [];
+                        root.lastUpdate = data.last_update || "";
+                        // Per-account connection/login errors reported by the daemon
+                        let errs = data.errors || [];
+                        root.errorMessage = errs.length > 0
+                            ? errs.map(function(e) { return e.account + "：" + e.message; }).join("\n")
+                            : "";
+                    }
+                } catch(e) {
+                    root.errorMessage = "Parse Error";
+                    root.unreadMails = [];
+                }
+            }
+        }
+    }
+
+    // Horizontal bar component
+    // NOTE: no MouseArea here — BasePill handles clicks (opens the popout).
+    // Adding our own MouseArea would sit on top of BasePill's handler and
+    // swallow the click, so the popout would never open.
+    horizontalBarPill: Component {
+        Row {
+            id: contentRow
+            spacing: Theme.spacingXS
+            opacity: root.errorMessage ? 0.5 : 1.0
+
+            // Mail icon
+            DankIcon {
+                name: root.unreadCount > 0 ? "mail" : "mail_outline"
+                size: Theme.iconSizeSmall
+                color: root.unreadCount > 0 ? Theme.primary : Theme.surfaceText
+                anchors.verticalCenter: parent.verticalCenter
+            }
+
+            // Unread Count tag
+            Rectangle {
+                visible: root.unreadCount > 0
+                width: Math.max(16, countText.implicitWidth + 8)
+                height: 16
+                radius: 8
+                color: Theme.primary
+                anchors.verticalCenter: parent.verticalCenter
+
+                StyledText {
+                    id: countText
+                    text: root.unreadCount > 99 ? "99+" : root.unreadCount.toString()
+                    font.pixelSize: 10
+                    font.weight: Font.Bold
+                    color: Theme.onPrimary
+                    anchors.centerIn: parent
+                }
+            }
+
+            // Error indicator
+            DankIcon {
+                visible: root.errorMessage !== ""
+                name: "error"
+                size: Theme.iconSizeSmall - 4
+                color: Theme.error
+                anchors.verticalCenter: parent.verticalCenter
+            }
+        }
+    }
+
+    // Vertical bar component
+    verticalBarPill: Component {
+        Column {
+            id: contentColumn
+            spacing: Theme.spacingXS
+            opacity: root.errorMessage ? 0.5 : 1.0
+
+            DankIcon {
+                name: root.unreadCount > 0 ? "mail" : "mail_outline"
+                size: Theme.iconSizeSmall
+                color: root.unreadCount > 0 ? Theme.primary : Theme.surfaceText
+                anchors.horizontalCenter: parent.horizontalCenter
+            }
+
+            Rectangle {
+                visible: root.unreadCount > 0
+                width: Math.max(16, vCountText.implicitWidth + 8)
+                height: 16
+                radius: 8
+                color: Theme.primary
+                anchors.horizontalCenter: parent.horizontalCenter
+
+                StyledText {
+                    id: vCountText
+                    text: root.unreadCount > 99 ? "99+" : root.unreadCount.toString()
+                    font.pixelSize: 10
+                    font.weight: Font.Bold
+                    color: Theme.onPrimary
+                    anchors.centerIn: parent
+                }
+            }
+        }
+    }
+
+    // Popout details window
+    popoutContent: Component {
+        PopoutComponent {
+            id: popout
+            headerText: root.selectedMail ? "邮件详情" : "未读邮件"
+            showCloseButton: false
+
+            // ─────────────── List view ───────────────
+            Column {
+                width: parent.width
+                spacing: Theme.spacingM
+                visible: root.selectedMail === null
+
+                // Header status block (left: status, right: 一键已读 + 刷新)
+                StyledRect {
+                    width: parent.width
+                    height: 50
+                    color: Theme.surfaceContainerHigh
+                    radius: Theme.cornerRadius
+
+                    // Left: icon + status text
+                    Row {
+                        anchors.left: parent.left
+                        anchors.right: headerActions.left
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.leftMargin: Theme.spacingM
+                        anchors.rightMargin: Theme.spacingS
+                        spacing: Theme.spacingS
+
+                        DankIcon {
+                            name: "mail"
+                            size: Theme.iconSize
+                            color: root.unreadCount > 0 ? Theme.primary : Theme.surfaceVariantText
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+
+                        StyledText {
+                            text: root.unreadCount > 0
+                                ? ("您有 " + root.unreadCount + " 封未读邮件")
+                                : (root.errorMessage ? "连接错误"
+                                    : (root.totalCount > 0 ? "邮件已全部读完" : "暂无邮件"))
+                            font.weight: Font.Bold
+                            font.pixelSize: Theme.fontSizeMedium
+                            color: Theme.surfaceText
+                            elide: Text.ElideRight
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                    }
+
+                    // Right: action buttons
+                    Row {
+                        id: headerActions
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.rightMargin: Theme.spacingS
+                        spacing: Theme.spacingXS
+
+                        // 一键已读：标记当前筛选下全部未读为已读
+                        Rectangle {
+                            width: markAllRow.implicitWidth + Theme.spacingM
+                            height: Theme.iconSize * 1.4
+                            radius: Theme.cornerRadius
+                            visible: root.unreadCount > 0
+                            color: markAllArea.containsMouse ? Theme.primaryHover : Theme.primary
+                            anchors.verticalCenter: parent.verticalCenter
+
+                            Row {
+                                id: markAllRow
+                                anchors.centerIn: parent
+                                spacing: Theme.spacingXS
+                                DankIcon {
+                                    name: "mark_email_read"
+                                    size: Theme.iconSize * 0.7
+                                    color: Theme.onPrimary
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                                StyledText {
+                                    text: "一键已读"
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: Theme.onPrimary
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                            }
+                            MouseArea {
+                                id: markAllArea
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.markAllRead()
+                            }
+                        }
+
+                        // 刷新
+                        Rectangle {
+                            width: Theme.iconSize * 1.4
+                            height: Theme.iconSize * 1.4
+                            radius: Theme.cornerRadius
+                            color: refreshArea.containsMouse ? Theme.surfaceContainerHighest : Theme.surfaceContainer
+                            anchors.verticalCenter: parent.verticalCenter
+
+                            DankIcon {
+                                anchors.centerIn: parent
+                                name: "refresh"
+                                size: Theme.iconSize * 0.8
+                                color: refreshArea.containsMouse ? Theme.primary : Theme.surfaceText
+                            }
+                            MouseArea {
+                                id: refreshArea
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: statusProcess.running = true
+                            }
+                        }
+                    }
+                }
+
+                // 操作提示（如「已全部标记已读」）
+                StyledText {
+                    visible: root.toastText !== ""
+                    width: parent.width
+                    text: root.toastText
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.primary
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.WordWrap
+                }
+
+                // Error message display (grows with content)
+                StyledRect {
+                    visible: root.errorMessage !== ""
+                    width: parent.width
+                    height: errorText.implicitHeight + Theme.spacingM * 2
+                    color: Theme.surfaceContainerHigh
+                    radius: Theme.cornerRadius
+
+                    StyledText {
+                        id: errorText
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: root.errorMessage
+                        color: Theme.error
+                        font.pixelSize: Theme.fontSizeSmall
+                        wrapMode: Text.WordWrap
+                        width: parent.width - Theme.spacingM * 2
+                    }
+                }
+
+                // Account filter chips (only when more than one account has mail)
+                Flow {
+                    width: parent.width
+                    spacing: Theme.spacingXS
+                    visible: root.accountNames.length > 1
+
+                    // "全部" chip
+                    Rectangle {
+                        height: 24
+                        width: allChipText.implicitWidth + Theme.spacingM
+                        radius: 12
+                        color: root.accountFilter === "" ? Theme.primary : Theme.surfaceContainerHigh
+                        StyledText {
+                            id: allChipText
+                            anchors.centerIn: parent
+                            text: "全部"
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: root.accountFilter === "" ? Theme.onPrimary : Theme.surfaceText
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.accountFilter = ""
+                        }
+                    }
+
+                    Repeater {
+                        model: root.accountNames
+                        delegate: Rectangle {
+                            required property var modelData
+                            readonly property bool active: root.accountFilter === modelData
+                            height: 24
+                            width: chipText.implicitWidth + Theme.spacingM
+                            radius: 12
+                            color: active ? Theme.primary : Theme.surfaceContainerHigh
+                            StyledText {
+                                id: chipText
+                                anchors.centerIn: parent
+                                text: modelData
+                                font.pixelSize: Theme.fontSizeSmall
+                                color: active ? Theme.onPrimary : Theme.surfaceText
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.accountFilter = modelData
+                            }
+                        }
+                    }
+                }
+
+                // Mail list (scrollable)
+                DankFlickable {
+                    width: parent.width
+                    height: Math.max(80, root.popoutHeight - (root.accountNames.length > 1 ? 175 : 145))
+                    visible: root.totalCount > 0
+                    contentHeight: mailColumn.implicitHeight
+                    clip: true
+
+                    Column {
+                        id: mailColumn
+                        width: parent.width
+                        spacing: Theme.spacingS
+
+                        Repeater {
+                            model: root.filteredMails.slice(0, root.maxMailsShown)
+                            delegate: StyledRect {
+                                required property var modelData
+                                width: mailColumn.width
+                                height: delcol.implicitHeight + Theme.spacingM * 2
+                                color: mailArea.containsMouse ? Theme.surfaceContainerHigh : Theme.surfaceContainer
+                                radius: Theme.cornerRadius
+                                // 已读邮件暗化（仍保留显示）
+                                opacity: modelData.seen ? 0.55 : 1.0
+
+                                readonly property bool isSpam: modelData.folder && modelData.folder !== "INBOX"
+
+                                Column {
+                                    id: delcol
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    anchors.margins: Theme.spacingM
+                                    anchors.leftMargin: Theme.spacingM
+                                    anchors.rightMargin: Theme.spacingM
+                                    spacing: 3
+
+                                    Row {
+                                        width: parent.width
+                                        spacing: Theme.spacingXS
+                                        // 未读红点（已读时透明，保留占位以对齐）
+                                        Rectangle {
+                                            width: 8
+                                            height: 8
+                                            radius: 4
+                                            color: modelData.seen ? "transparent" : Theme.error
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+                                        StyledText {
+                                            text: modelData.from || "未知发件人"
+                                            font.weight: modelData.seen ? Font.Normal : Font.Bold
+                                            font.pixelSize: Theme.fontSizeSmall
+                                            color: Theme.surfaceText
+                                            elide: Text.ElideRight
+                                            width: parent.width - 56 - 8 - Theme.spacingXS * 2
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+                                        StyledText {
+                                            text: modelData.date ? modelData.date.substring(11, 16) : ""
+                                            font.pixelSize: 10
+                                            color: Theme.surfaceVariantText
+                                            horizontalAlignment: Text.AlignRight
+                                            width: 56
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+                                    }
+
+                                    StyledText {
+                                        text: modelData.subject || "(无主题)"
+                                        font.pixelSize: 11
+                                        color: Theme.surfaceVariantText
+                                        elide: Text.ElideRight
+                                        width: parent.width
+                                    }
+
+                                    // Category tags: account + folder
+                                    Row {
+                                        spacing: Theme.spacingXS
+
+                                        Rectangle {
+                                            height: 16
+                                            width: accTag.implicitWidth + 10
+                                            radius: 8
+                                            color: Theme.surfaceContainerHighest
+                                            StyledText {
+                                                id: accTag
+                                                anchors.centerIn: parent
+                                                text: modelData.account || ""
+                                                font.pixelSize: 9
+                                                color: Theme.surfaceVariantText
+                                            }
+                                        }
+
+                                        Rectangle {
+                                            height: 16
+                                            width: folderTag.implicitWidth + 10
+                                            radius: 8
+                                            color: isSpam ? Theme.error : Theme.primary
+                                            StyledText {
+                                                id: folderTag
+                                                anchors.centerIn: parent
+                                                text: isSpam ? "垃圾邮件" : "收件箱"
+                                                font.pixelSize: 9
+                                                color: isSpam ? Theme.surfaceText : Theme.onPrimary
+                                            }
+                                        }
+                                    }
+                                }
+
+                                MouseArea {
+                                    id: mailArea
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: root.openMail(modelData)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Empty state indicator
+                StyledRect {
+                    visible: root.totalCount === 0 && root.errorMessage === ""
+                    width: parent.width
+                    height: 100
+                    color: Theme.surfaceContainer
+                    radius: Theme.cornerRadius
+
+                    Column {
+                        anchors.centerIn: parent
+                        spacing: Theme.spacingS
+                        DankIcon {
+                            name: "mail_outline"
+                            size: Theme.iconSize * 1.5
+                            color: Theme.surfaceVariantText
+                            anchors.horizontalCenter: parent.horizontalCenter
+                        }
+                        StyledText {
+                            text: "收件箱已全部读完"
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: Theme.surfaceVariantText
+                            anchors.horizontalCenter: parent.horizontalCenter
+                        }
+                    }
+                }
+
+            }
+
+            // ─────────────── Detail view ───────────────
+            Column {
+                width: parent.width
+                spacing: Theme.spacingS
+                visible: root.selectedMail !== null
+
+                // Toolbar: back + mark-read
+                Row {
+                    width: parent.width
+                    spacing: Theme.spacingS
+
+                    Rectangle {
+                        width: Theme.iconSize * 1.4
+                        height: Theme.iconSize * 1.4
+                        radius: Theme.cornerRadius
+                        color: backArea.containsMouse ? Theme.surfaceContainerHighest : Theme.surfaceContainerHigh
+                        DankIcon {
+                            anchors.centerIn: parent
+                            name: "arrow_back"
+                            size: Theme.iconSize * 0.8
+                            color: Theme.surfaceText
+                        }
+                        MouseArea {
+                            id: backArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.closeMail()
+                        }
+                    }
+
+                    Item {
+                        width: parent.width - (Theme.iconSize * 1.4) - readBtn.width - Theme.spacingS * 2
+                        height: 1
+                    }
+
+                    Rectangle {
+                        id: readBtn
+                        width: readRow.implicitWidth + Theme.spacingM * 2
+                        height: Theme.iconSize * 1.4
+                        radius: Theme.cornerRadius
+                        color: readArea.containsMouse ? Theme.primaryHover : Theme.primary
+                        Row {
+                            id: readRow
+                            anchors.centerIn: parent
+                            spacing: Theme.spacingXS
+                            DankIcon {
+                                name: "mark_email_read"
+                                size: Theme.iconSize * 0.7
+                                color: Theme.onPrimary
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+                            StyledText {
+                                text: "标记已读"
+                                font.pixelSize: Theme.fontSizeSmall
+                                color: Theme.onPrimary
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+                        }
+                        MouseArea {
+                            id: readArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.markSelectedRead()
+                        }
+                    }
+                }
+
+                // Subject
+                StyledText {
+                    width: parent.width
+                    text: root.detailSubject || "(无主题)"
+                    font.weight: Font.Bold
+                    font.pixelSize: Theme.fontSizeMedium
+                    color: Theme.surfaceText
+                    wrapMode: Text.WordWrap
+                }
+
+                // From + date
+                StyledText {
+                    width: parent.width
+                    text: root.detailFrom
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.surfaceVariantText
+                    wrapMode: Text.WordWrap
+                }
+                StyledText {
+                    width: parent.width
+                    text: root.detailDate
+                    font.pixelSize: 10
+                    color: Theme.surfaceVariantText
+                }
+
+                Rectangle {
+                    width: parent.width
+                    height: 1
+                    color: Theme.outline
+                    opacity: 0.3
+                }
+
+                // Loading / error / body
+                StyledText {
+                    visible: root.detailLoading
+                    text: "正在加载正文…"
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.surfaceVariantText
+                }
+                StyledText {
+                    visible: root.detailError !== ""
+                    width: parent.width
+                    text: "加载失败：" + root.detailError
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.error
+                    wrapMode: Text.WordWrap
+                }
+
+                DankFlickable {
+                    visible: !root.detailLoading && root.detailError === ""
+                    width: parent.width
+                    height: Math.max(100, root.popoutHeight - 230)
+                    contentHeight: bodyText.implicitHeight
+                    clip: true
+
+                    // 正文 HTML 由 Rust 守护进程生成（URL/验证码已是可点击链接），
+                    // 这里只注入主题色后用 RichText 渲染；可鼠标选中复制。
+                    TextEdit {
+                        id: bodyText
+                        width: parent.width
+                        text: root.detailBody.replace(/<a /g, '<a style="color:' + String(Theme.primary) + ';text-decoration:none" ')
+                        textFormat: TextEdit.RichText
+                        readOnly: true
+                        selectByMouse: true
+                        persistentSelection: true
+                        wrapMode: TextEdit.Wrap
+                        font.pixelSize: Theme.fontSizeSmall
+                        font.family: Theme.fontFamily
+                        color: Theme.surfaceText
+                        selectionColor: Theme.primary
+                        selectedTextColor: Theme.onPrimary
+                        onLinkActivated: function(link) {
+                            if (link.indexOf("copy:") === 0)
+                                root.copyToClipboard(link.substring(5));
+                            else
+                                root.openExternal(link);
+                        }
+
+                        // 链接上显示手型光标（NoButton 不抢选择/点击事件）
+                        MouseArea {
+                            anchors.fill: parent
+                            acceptedButtons: Qt.NoButton
+                            cursorShape: bodyText.hoveredLink ? Qt.PointingHandCursor : Qt.IBeamCursor
+                        }
+                    }
+                }
+
+                // 剪贴板/操作的轻量提示
+                StyledText {
+                    visible: root.toastText !== ""
+                    width: parent.width
+                    text: root.toastText
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.primary
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.WordWrap
+                }
+            }
+        }
+    }
+}
