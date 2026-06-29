@@ -151,10 +151,10 @@ PluginSettings {
     SliderSetting {
         settingKey: "maxMailsShown"
         label: "最大显示邮件数"
-        description: "弹出面板中显示的最大邮件数量"
-        defaultValue: 5
+        description: "弹出面板列表中显示的最大邮件数量（列表可滚动）"
+        defaultValue: 15
         minimum: 1
-        maximum: 20
+        maximum: 60
     }
 
     SliderSetting {

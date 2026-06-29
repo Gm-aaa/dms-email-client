@@ -11,7 +11,7 @@ PluginComponent {
 
     // Settings from pluginData
     readonly property int refreshInterval: (pluginData && pluginData.refreshInterval) ? pluginData.refreshInterval : 10
-    readonly property int maxMailsShown: (pluginData && pluginData.maxMailsShown) ? pluginData.maxMailsShown : 5
+    readonly property int maxMailsShown: (pluginData && pluginData.maxMailsShown) ? pluginData.maxMailsShown : 15
 
     // Popout configurations
     popoutWidth: 320
@@ -79,18 +79,35 @@ PluginComponent {
         bodyProcess.aFolder = mail.folder || "INBOX";
         bodyProcess.aUid = String(mail.uid);
         bodyProcess.running = true;
+        // 打开即已读：乐观去掉红点，并异步通知守护进程设置 \Seen（不离开详情页）
+        root.markMailRead(mail);
     }
 
     function closeMail() {
         root.selectedMail = null;
     }
 
-    function markSelectedRead() {
-        if (!root.selectedMail)
+    // 把一封邮件标为已读：乐观更新（保留在列表，仅去红点）+ 异步 IMAP \Seen。
+    // 已读则直接跳过，避免重复联网。
+    function markMailRead(mail) {
+        if (!mail || mail.seen)
             return;
-        readProcess.aAccount = root.selectedMail.account;
-        readProcess.aFolder = root.selectedMail.folder || "INBOX";
-        readProcess.aUid = String(root.selectedMail.uid);
+        let uid = mail.uid;
+        let acc = mail.account;
+        let fld = mail.folder || "INBOX";
+        root.unreadMails = root.unreadMails.map(function(m) {
+            if (m.uid === uid && m.account === acc && (m.folder || "INBOX") === fld)
+                return Object.assign({}, m, { seen: true });
+            return m;
+        });
+        if (root.selectedMail && root.selectedMail.uid === uid
+            && root.selectedMail.account === acc
+            && (root.selectedMail.folder || "INBOX") === fld)
+            root.selectedMail = Object.assign({}, root.selectedMail, { seen: true });
+        readProcess.aAccount = acc;
+        readProcess.aFolder = fld;
+        readProcess.aUid = String(uid);
+        readProcess.running = false;
         readProcess.running = true;
     }
 
@@ -167,22 +184,10 @@ PluginComponent {
             onStreamFinished: {
                 try {
                     let d = JSON.parse(this.text);
-                    if (d.ok) {
-                        // 乐观地把这封置为已读（保留在列表，仅去红点），再回查同步。
-                        // 按 account+folder+uid 匹配（UID 是按文件夹的）。
-                        if (root.selectedMail) {
-                            let uid = root.selectedMail.uid;
-                            let acc = root.selectedMail.account;
-                            let fld = root.selectedMail.folder || "INBOX";
-                            root.unreadMails = root.unreadMails.map(function(m) {
-                                if (m.uid === uid && m.account === acc && (m.folder || "INBOX") === fld)
-                                    return Object.assign({}, m, { seen: true });
-                                return m;
-                            });
-                        }
-                        root.closeMail();
+                    // 已读已在 markMailRead 中乐观更新；这里仅回查同步真实状态，
+                    // 不离开详情页（用户正在阅读这封邮件）。
+                    if (d.ok)
                         statusProcess.running = true;
-                    }
                 } catch (e) {}
             }
         }
@@ -461,13 +466,29 @@ PluginComponent {
                                 anchors.centerIn: parent
                                 spacing: Theme.spacingXS
                                 DankIcon {
-                                    name: "mark_email_read"
+                                    id: markAllIcon
+                                    // 进行中：换成转圈图标并持续旋转
+                                    name: readAllProcess.running ? "autorenew" : "mark_email_read"
                                     size: Theme.iconSize * 0.7
                                     color: Theme.onPrimary
                                     anchors.verticalCenter: parent.verticalCenter
+                                    RotationAnimator {
+                                        target: markAllIcon
+                                        from: 0; to: 360
+                                        duration: 800
+                                        loops: Animation.Infinite
+                                        running: readAllProcess.running
+                                    }
+                                    Connections {
+                                        target: readAllProcess
+                                        function onRunningChanged() {
+                                            if (!readAllProcess.running)
+                                                markAllIcon.rotation = 0;
+                                        }
+                                    }
                                 }
                                 StyledText {
-                                    text: "一键已读"
+                                    text: readAllProcess.running ? "处理中…" : "一键已读"
                                     font.pixelSize: Theme.fontSizeSmall
                                     color: Theme.onPrimary
                                     anchors.verticalCenter: parent.verticalCenter
@@ -478,7 +499,8 @@ PluginComponent {
                                 anchors.fill: parent
                                 hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor
-                                onClicked: root.markAllRead()
+                                // 进行中忽略点击，避免重复触发
+                                onClicked: if (!readAllProcess.running) root.markAllRead()
                             }
                         }
 
@@ -491,17 +513,29 @@ PluginComponent {
                             anchors.verticalCenter: parent.verticalCenter
 
                             DankIcon {
+                                id: refreshIcon
                                 anchors.centerIn: parent
                                 name: "refresh"
                                 size: Theme.iconSize * 0.8
                                 color: refreshArea.containsMouse ? Theme.primary : Theme.surfaceText
+                                // 刷新近乎瞬时（只读守护进程内存状态），用一次性 360° 转动作为点击反馈
+                                RotationAnimator {
+                                    id: refreshSpin
+                                    target: refreshIcon
+                                    from: 0; to: 360
+                                    duration: 500
+                                    running: false
+                                }
                             }
                             MouseArea {
                                 id: refreshArea
                                 anchors.fill: parent
                                 hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor
-                                onClicked: statusProcess.running = true
+                                onClicked: {
+                                    refreshSpin.restart();
+                                    statusProcess.running = true;
+                                }
                             }
                         }
                     }
@@ -743,7 +777,7 @@ PluginComponent {
                 spacing: Theme.spacingS
                 visible: root.selectedMail !== null
 
-                // Toolbar: back + mark-read
+                // Toolbar: back（打开邮件已自动标记已读，无需手动按钮）
                 Row {
                     width: parent.width
                     spacing: Theme.spacingS
@@ -765,43 +799,6 @@ PluginComponent {
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
                             onClicked: root.closeMail()
-                        }
-                    }
-
-                    Item {
-                        width: parent.width - (Theme.iconSize * 1.4) - readBtn.width - Theme.spacingS * 2
-                        height: 1
-                    }
-
-                    Rectangle {
-                        id: readBtn
-                        width: readRow.implicitWidth + Theme.spacingM * 2
-                        height: Theme.iconSize * 1.4
-                        radius: Theme.cornerRadius
-                        color: readArea.containsMouse ? Theme.primaryHover : Theme.primary
-                        Row {
-                            id: readRow
-                            anchors.centerIn: parent
-                            spacing: Theme.spacingXS
-                            DankIcon {
-                                name: "mark_email_read"
-                                size: Theme.iconSize * 0.7
-                                color: Theme.onPrimary
-                                anchors.verticalCenter: parent.verticalCenter
-                            }
-                            StyledText {
-                                text: "标记已读"
-                                font.pixelSize: Theme.fontSizeSmall
-                                color: Theme.onPrimary
-                                anchors.verticalCenter: parent.verticalCenter
-                            }
-                        }
-                        MouseArea {
-                            id: readArea
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: root.markSelectedRead()
                         }
                     }
                 }
