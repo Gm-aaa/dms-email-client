@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -190,13 +191,44 @@ fn json_err(msg: &str) -> String {
     serde_json::json!({ "ok": false, "error": msg }).to_string()
 }
 
-/// 建立一个 IMAP over TLS 会话并登录
+/// 建立一个 IMAP over TLS 会话并登录。
+///
+/// 注意：`imap::connect` 内部用 `TcpStream::connect` 且不设任何超时，登录前读取
+/// 服务器 greeting 也是无超时阻塞。当守护进程在网络/代理尚未就绪时启动（例如登录
+/// 会话刚把插件拉起、TUN 代理还没接管），TCP 可能连上代理但 greeting 永远不到，
+/// 线程就永久卡在 `read_greeting()`：既不返回 Ok（状态永远为空），也不返回 Err
+/// （`run_account_loop` 的 10 秒重连循环不触发），前端因此一直空白且无报错。
+/// 所以这里手动建连，为「TCP 连接 + TLS 握手 + greeting + 登录」设置超时；成功后
+/// 清除超时，交还给正常的 fetch / IDLE（IDLE 会自行设置并复位读超时）。
 fn connect_session(account: &Account) -> Result<ImapSession, Box<dyn std::error::Error>> {
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+    const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
     let tls = TlsConnector::builder().build()?;
-    let client = imap::connect((&account.host[..], account.port), &account.host, &tls)?;
+
+    // 解析地址并带超时建立 TCP 连接，避免半就绪的代理/网络下永久阻塞
+    let addr = (account.host.as_str(), account.port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or("无法解析 IMAP 服务器地址")?;
+    let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+    tcp.set_read_timeout(Some(IO_TIMEOUT))?;
+    tcp.set_write_timeout(Some(IO_TIMEOUT))?;
+    // 同一 socket 的副本：握手/登录完成后用它清除超时（SO_RCVTIMEO 在 dup 的 fd 间共享）
+    let tcp_ctl = tcp.try_clone()?;
+
+    // TLS 握手 + 读取 greeting + 登录，均受上面的读写超时约束
+    let tls_stream = tls.connect(&account.host, tcp)?;
+    let mut client = imap::Client::new(tls_stream);
+    client.read_greeting()?;
     let session = client
         .login(&account.username, &account.password)
         .map_err(|e| e.0)?;
+
+    // 连接已建立并登录成功：清除超时，恢复正常阻塞语义
+    let _ = tcp_ctl.set_read_timeout(None);
+    let _ = tcp_ctl.set_write_timeout(None);
+
     Ok(session)
 }
 
