@@ -9,7 +9,8 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::{Arc, RwLock};
+use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -33,6 +34,31 @@ pub fn socket_path() -> String {
 
 /// IMAP over TLS 会话类型别名
 type ImapSession = imap::Session<native_tls::TlsStream<std::net::TcpStream>>;
+
+/// 状态变更广播：单例的「版本号 + 条件变量」。任何修改 `DaemonState` 的地方都调用
+/// [`notify_state_changed`]，`watch` 长连接会被立即唤醒并推送最新状态，从而做到
+/// 「新邮件到达 / 标记已读」零延迟反映到前端，无需前端轮询。
+struct Notifier {
+    version: Mutex<u64>,
+    cv: Condvar,
+}
+
+static NOTIFIER: OnceLock<Notifier> = OnceLock::new();
+
+fn notifier() -> &'static Notifier {
+    NOTIFIER.get_or_init(|| Notifier {
+        version: Mutex::new(0),
+        cv: Condvar::new(),
+    })
+}
+
+/// 通知所有 `watch` 订阅者：状态已变化，请重新推送。
+fn notify_state_changed() {
+    let n = notifier();
+    let mut v = n.version.lock().unwrap_or_else(|e| e.into_inner());
+    *v = v.wrapping_add(1);
+    n.cv.notify_all();
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailInfo {
@@ -70,18 +96,28 @@ pub struct DaemonState {
 
 /// 记录某账户的错误（同名先移除再插入，避免重复）
 fn set_account_error(state: &Arc<RwLock<DaemonState>>, account: &str, message: String) {
-    let mut w = state.write().unwrap_or_else(|e| e.into_inner());
-    w.errors.retain(|e| e.account != account);
-    w.errors.push(AccountError {
-        account: account.to_string(),
-        message,
-    });
+    {
+        let mut w = state.write().unwrap_or_else(|e| e.into_inner());
+        w.errors.retain(|e| e.account != account);
+        w.errors.push(AccountError {
+            account: account.to_string(),
+            message,
+        });
+    }
+    notify_state_changed();
 }
 
 /// 清除某账户的错误（连接/登录成功后调用）
 fn clear_account_error(state: &Arc<RwLock<DaemonState>>, account: &str) {
-    let mut w = state.write().unwrap_or_else(|e| e.into_inner());
-    w.errors.retain(|e| e.account != account);
+    let changed = {
+        let mut w = state.write().unwrap_or_else(|e| e.into_inner());
+        let before = w.errors.len();
+        w.errors.retain(|e| e.account != account);
+        w.errors.len() != before
+    };
+    if changed {
+        notify_state_changed();
+    }
 }
 
 pub fn run_daemon(config: Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -126,7 +162,14 @@ pub fn run_daemon(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     for stream in listener.incoming() {
         match stream {
-            Ok(mut stream) => handle_client(&mut stream, &state, &accounts, &cache_dir),
+            Ok(stream) => {
+                // 每连接一线程：`watch` 是长连接（会一直阻塞等待状态变更再推送），
+                // 若仍在 accept 循环里同步处理会堵死后续的 body/read/status 请求。
+                let state = Arc::clone(&state);
+                let accounts = Arc::clone(&accounts);
+                let cache_dir = cache_dir.clone();
+                thread::spawn(move || handle_client(stream, &state, &accounts, &cache_dir));
+            }
             Err(e) => {
                 eprintln!("Socket connection error: {:?}", e);
             }
@@ -143,7 +186,7 @@ pub fn run_daemon(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 /// - `read\t<account>\t<folder>\t<uid>`：标记该邮件为已读
 /// - `read_all\t<account>`：标记该账户（account 为空则所有账户）当前全部未读为已读
 fn handle_client(
-    stream: &mut UnixStream,
+    mut stream: UnixStream,
     state: &Arc<RwLock<DaemonState>>,
     accounts: &[Account],
     cache_dir: &str,
@@ -157,6 +200,10 @@ fn handle_client(
     let parts: Vec<&str> = line.split('\t').collect();
 
     match parts.as_slice() {
+        ["watch"] => {
+            // 长连接订阅：立即推送当前状态，之后每次状态变更即推送一行 JSON。
+            handle_watch(stream, state);
+        }
         ["reload"] | ["shutdown"] => {
             let _ = stream.write_all(b"{\"ok\":true}");
             let _ = stream.flush();
@@ -184,6 +231,36 @@ fn handle_client(
             };
             let _ = stream.write_all(data.as_bytes());
         }
+    }
+}
+
+/// `watch` 长连接处理：先推当前状态，然后阻塞等待，状态一变即推送最新状态
+/// （一行 JSON + `\n`）。带 60 秒心跳：即便无变更也周期性重推，既作兜底，又能借
+/// 写失败探测到已断开的前端，避免线程永久滞留。coalescing：多次快速变更只需一次重推。
+fn handle_watch(mut stream: UnixStream, state: &Arc<RwLock<DaemonState>>) {
+    let n = notifier();
+    // 进入时的版本号；若在快照/发送期间发生变更，下面的 wait 会立即返回，不漏更新。
+    let mut last = *n.version.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        // 推送当前状态快照（读锁尽快释放，避免阻塞写侧）
+        let json = {
+            let r = state.read().unwrap_or_else(|e| e.into_inner());
+            serde_json::to_string(&*r).unwrap_or_default()
+        };
+        if stream.write_all(json.as_bytes()).is_err()
+            || stream.write_all(b"\n").is_err()
+            || stream.flush().is_err()
+        {
+            break; // 前端已断开，退出线程
+        }
+
+        // 阻塞直到状态变更（版本号推进）或 60 秒心跳超时
+        let guard = n.version.lock().unwrap_or_else(|e| e.into_inner());
+        let (guard, _timeout) = n
+            .cv
+            .wait_timeout_while(guard, Duration::from_secs(60), |v| *v == last)
+            .unwrap_or_else(|e| e.into_inner());
+        last = *guard;
     }
 }
 
@@ -347,6 +424,8 @@ fn mark_read(
                 }
             }
         }
+        // 已读状态变化 → 立即推送
+        notify_state_changed();
     }
 
     result.unwrap_or_else(|e| json_err(&e.to_string()))
@@ -412,14 +491,18 @@ fn mark_read_all(
             Ok(n) => {
                 marked += n;
                 // 把该账户已处理的邮件置为已读（保留在列表，仅去红点）
-                let mut w = state.write().unwrap_or_else(|e| e.into_inner());
-                for m in w.unread_mails.iter_mut() {
-                    if &m.account == acc_name
-                        && by_folder.get(&m.folder).is_some_and(|v| v.contains(&m.uid))
-                    {
-                        m.seen = true;
+                {
+                    let mut w = state.write().unwrap_or_else(|e| e.into_inner());
+                    for m in w.unread_mails.iter_mut() {
+                        if &m.account == acc_name
+                            && by_folder.get(&m.folder).is_some_and(|v| v.contains(&m.uid))
+                        {
+                            m.seen = true;
+                        }
                     }
                 }
+                // 已读状态变化 → 立即推送
+                notify_state_changed();
             }
             Err(e) => errors.push(format!("{}: {}", acc_name, e)),
         }
@@ -549,17 +632,47 @@ fn already_running() -> bool {
     false
 }
 
-/// 后台线程：轮询配置文件修改时间，发生变更则退出进程（前端会重启以加载新配置）。
+/// 后台线程：用 inotify 监视配置文件，发生变更则退出进程（前端会重启以加载新配置）。
+///
+/// 监视的是配置文件所在**目录**而非文件本身：图形设置保存时通常是「写临时文件再
+/// rename 覆盖」，直接盯着原文件的 inode 会在 rename 后失效；盯目录能可靠捕获对该
+/// 文件名的创建 / 修改 / 移入。相比旧的每 3 秒轮询 mtime，inotify 空闲时零唤醒。
 fn spawn_config_watcher() {
+    use notify::{RecursiveMode, Watcher};
+
     let path = Config::get_path();
-    let initial = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(3));
-        let current = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-        if current != initial {
-            println!("检测到配置文件变更，守护进程退出以重新加载新配置。");
-            let _ = fs::remove_file(socket_path());
-            std::process::exit(0);
+    let dir = path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("配置监视器初始化失败（配置热重载不可用）：{:?}", e);
+                return;
+            }
+        };
+        if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
+            eprintln!("配置监视器无法监视 {:?}：{:?}", dir, e);
+            return;
+        }
+
+        for res in rx {
+            let event = match res {
+                Ok(ev) => ev,
+                Err(_) => continue,
+            };
+            // 仅当事件涉及配置文件本身时才触发重载
+            if event.paths.iter().any(|p| p == &path) {
+                println!("检测到配置文件变更，守护进程退出以重新加载新配置。");
+                let _ = fs::remove_file(socket_path());
+                std::process::exit(0);
+            }
         }
     });
 }
@@ -803,6 +916,8 @@ fn connect_and_idle(
             w_state.unread_mails.sort_by(|a, b| b.date.cmp(&a.date));
             w_state.last_update = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         }
+        // 状态已更新（可能有新邮件）→ 立即推送给 watch 订阅者，实现零延迟。
+        notify_state_changed();
 
         known = current;
         is_first_sync = false;

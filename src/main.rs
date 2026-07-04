@@ -18,8 +18,12 @@ struct Cli {
 enum Commands {
     /// Start the background mail checker daemon
     Daemon,
-    /// Query the current state from the daemon
+    /// Query the current state from the daemon (one-shot)
     Status,
+    /// Subscribe to daemon state changes; streams one JSON line per update.
+    /// Runs until the daemon closes the connection. Used by the frontend instead
+    /// of polling, so new mail / read changes reach the UI with zero delay.
+    Watch,
     /// Fetch the body of a specific email via the daemon
     Body {
         account: String,
@@ -72,6 +76,9 @@ fn main() {
                 eprintln!("Daemon error: {:?}", e);
                 std::process::exit(1);
             }
+        }
+        Some(Commands::Watch) => {
+            stream_command("watch");
         }
         Some(Commands::Status) | None => {
             // Default to query status
@@ -142,6 +149,37 @@ fn send_command(cmd: &str) {
             }
             // Directly output the JSON received from daemon
             println!("{}", response);
+        }
+        Err(_) => {
+            print_error_json("Daemon not running");
+        }
+    }
+}
+
+/// 连接守护进程 socket，发送订阅命令，然后把服务端持续推送的每一行**流式**转发到
+/// stdout（逐块读取并 flush，不等 EOF）。守护进程关闭连接或出错时返回，进程随之退出，
+/// 前端据此重连。前端用 SplitParser 逐行消费，实现零延迟的状态更新。
+fn stream_command(cmd: &str) {
+    match UnixStream::connect(daemon::socket_path()) {
+        Ok(mut stream) => {
+            let _ = stream.write_all(cmd.as_bytes());
+            let _ = stream.write_all(b"\n");
+            let _ = stream.flush();
+            let mut buf = [0u8; 4096];
+            let stdout = std::io::stdout();
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break, // 守护进程关闭了连接
+                    Ok(n) => {
+                        let mut lock = stdout.lock();
+                        if lock.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                        let _ = lock.flush();
+                    }
+                    Err(_) => break,
+                }
+            }
         }
         Err(_) => {
             print_error_json("Daemon not running");

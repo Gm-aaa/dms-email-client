@@ -10,7 +10,6 @@ PluginComponent {
     id: root
 
     // Settings from pluginData
-    readonly property int refreshInterval: (pluginData && pluginData.refreshInterval) ? pluginData.refreshInterval : 10
     readonly property int maxMailsShown: (pluginData && pluginData.maxMailsShown) ? pluginData.maxMailsShown : 15
 
     // Popout configurations
@@ -182,12 +181,10 @@ PluginComponent {
         running: false
         stdout: StdioCollector {
             onStreamFinished: {
+                // 已读已在 markMailRead 中乐观更新；daemon 标记成功后会通过 watch
+                // 主动推送权威状态，无需前端回查。
                 try {
-                    let d = JSON.parse(this.text);
-                    // 已读已在 markMailRead 中乐观更新；这里仅回查同步真实状态，
-                    // 不离开详情页（用户正在阅读这封邮件）。
-                    if (d.ok)
-                        statusProcess.running = true;
+                    JSON.parse(this.text);
                 } catch (e) {}
             }
         }
@@ -212,7 +209,7 @@ PluginComponent {
                             return m;
                         });
                         root.showToast("已全部标记已读（" + (d.marked || 0) + " 封）");
-                        statusProcess.running = true;
+                        // daemon 会通过 watch 推送权威状态，无需回查。
                     } else {
                         root.showToast("标记失败：" + (d.error || ""));
                     }
@@ -245,7 +242,7 @@ PluginComponent {
     // The daemon runs for as long as this widget (i.e. the enabled plugin) lives.
     // Quickshell terminates the process when the component is destroyed, so the
     // daemon is automatically started when the plugin is enabled and stopped when
-    // it is disabled/removed. The status poll below also restarts it if it dies.
+    // it is disabled/removed. The watch subscription below restarts it if it dies.
     Process {
         id: daemonProcess
         command: [root.binPath, "daemon"]
@@ -254,62 +251,65 @@ PluginComponent {
 
     Component.onCompleted: {
         daemonProcess.running = true;
+        watchProcess.running = true;
     }
 
-    // The daemon needs a moment to bind its IPC socket on first launch; poll again
-    // shortly after startup so the "Daemon not running" state clears quickly.
+    // Reconnect backoff counter for the watch subscription.
+    property int _watchRetries: 0
+
     Timer {
-        id: startupPoll
-        interval: 1500
-        running: true
+        id: watchRestartTimer
         repeat: false
-        onTriggered: statusProcess.running = true
+        onTriggered: watchProcess.running = true
     }
 
-    // Refresh on an interval
-    Timer {
-        id: refreshTimer
-        interval: root.refreshInterval * 1000
-        running: true
-        repeat: true
-        triggeredOnStart: true
-        onTriggered: {
-            statusProcess.running = true;
-        }
-    }
-
+    // Persistent subscription to daemon state. The daemon PUSHES one JSON line per
+    // state change (new mail / read / connection error), so there is NO polling and
+    // new mail reaches the UI with zero delay. When the connection drops (daemon
+    // down, crash, or config-change restart) the process exits: we (re)start the
+    // daemon and reconnect with exponential backoff.
     Process {
-        id: statusProcess
-        command: [root.binPath, "status"]
+        id: watchProcess
+        command: [root.binPath, "watch"]
         running: false
 
-        stdout: StdioCollector {
-            onStreamFinished: {
+        stdout: SplitParser {
+            onRead: line => {
+                const l = line.trim();
+                if (!l)
+                    return;
                 try {
-                    let data = JSON.parse(this.text);
+                    let data = JSON.parse(l);
                     if (data.error) {
-                        // CLI-level error (e.g. daemon not running)
+                        // CLI-level error (e.g. daemon not running). Do NOT reset the
+                        // backoff here, so a persistently-down daemon backs off.
                         root.errorMessage = data.error;
                         root.unreadMails = [];
-                        // Self-heal: (re)start the daemon if it is not running
-                        // (e.g. first launch, a crash, or a config-change restart).
-                        if (!daemonProcess.running) {
-                            daemonProcess.running = true;
-                        }
                     } else {
+                        // A real state push: connection is healthy, reset backoff.
+                        root._watchRetries = 0;
                         root.unreadMails = data.unread_mails || [];
                         root.lastUpdate = data.last_update || "";
-                        // Per-account connection/login errors reported by the daemon
                         let errs = data.errors || [];
                         root.errorMessage = errs.length > 0
                             ? errs.map(function(e) { return e.account + "：" + e.message; }).join("\n")
                             : "";
                     }
-                } catch(e) {
+                } catch (e) {
                     root.errorMessage = "Parse Error";
-                    root.unreadMails = [];
                 }
             }
+        }
+
+        onExited: exitCode => {
+            // Connection ended. Self-heal: (re)start the daemon if it is not running
+            // (first launch, a crash, or a config-change restart), then reconnect
+            // with exponential backoff (0.5s → capped at 30s).
+            if (!daemonProcess.running)
+                daemonProcess.running = true;
+            root._watchRetries = Math.min(root._watchRetries + 1, 6);
+            watchRestartTimer.interval = Math.min(30000, 500 * Math.pow(2, root._watchRetries - 1));
+            watchRestartTimer.start();
         }
     }
 
@@ -534,7 +534,9 @@ PluginComponent {
                                 cursorShape: Qt.PointingHandCursor
                                 onClicked: {
                                     refreshSpin.restart();
-                                    statusProcess.running = true;
+                                    // 状态本就由 daemon 实时推送；手动刷新即断开重连一次
+                                    // watch，强制立刻重新拉取一份权威状态（onExited 负责重连）。
+                                    watchProcess.running = false;
                                 }
                             }
                         }

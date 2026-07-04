@@ -131,23 +131,13 @@ PluginSettings {
 
     StyledText {
         width: parent.width
-        text: "配置邮件客户端的刷新频率、显示数量和邮箱账户。"
+        text: "配置邮件客户端的显示数量和邮箱账户。新邮件由守护进程实时推送，无需设置刷新间隔。"
         font.pixelSize: Theme.fontSizeSmall
         color: Theme.surfaceVariantText
         wrapMode: Text.WordWrap
     }
 
     // ── Slider Settings ──
-    SliderSetting {
-        settingKey: "refreshInterval"
-        label: "刷新间隔"
-        description: "查询未读邮件的频率"
-        defaultValue: 10
-        minimum: 5
-        maximum: 60
-        unit: "秒"
-    }
-
     SliderSetting {
         settingKey: "maxMailsShown"
         label: "最大显示邮件数"
