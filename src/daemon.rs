@@ -353,8 +353,9 @@ fn body_cache_path(cache_dir: &str, account: &str, folder: &str, uid: &str) -> s
     std::path::PathBuf::from(cache_dir)
         .join(sanitize_component(account))
         .join(sanitize_component(folder))
-        // v2：正文改为 HTML 缓存，换文件名以让旧的纯文本缓存自然失效
-        .join(format!("{}.v2.json", uid))
+        // v3：正文提取加入占位符→HTML 回退 + 实体解码，换文件名让旧缓存(含只存了
+        // 占位符 "Plain text version not available" 的那些)自然失效重取
+        .join(format!("{}.v3.json", uid))
 }
 
 /// 按需获取某封邮件的正文（只读打开，不会标记已读）；优先读磁盘缓存
