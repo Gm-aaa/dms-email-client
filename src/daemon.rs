@@ -4,7 +4,7 @@ use mail_parser::Address;
 use native_tls::TlsConnector;
 use notify_rust::Notification;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -58,6 +58,35 @@ fn notify_state_changed() {
     let mut v = n.version.lock().unwrap_or_else(|e| e.into_inner());
     *v = v.wrapping_add(1);
     n.cv.notify_all();
+}
+
+/// glibc 内存调优：把 malloc arena 上限设为 2，抑制多线程下 RSS 的过度预留
+/// （典型现象：同步尖峰后 RSS 迟迟不回落）。非 glibc 目标为 no-op。
+fn tune_allocator() {
+    #[cfg(target_env = "gnu")]
+    {
+        // M_ARENA_MAX = -8（见 glibc <malloc.h>）
+        extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        unsafe {
+            mallopt(-8, 2);
+        }
+    }
+}
+
+/// 把空闲堆页归还给 OS，用于同步尖峰（下载/解析一批头部）之后收敛 RSS。
+/// glibc 专有，其他平台 no-op。
+fn release_free_memory() {
+    #[cfg(target_env = "gnu")]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        unsafe {
+            malloc_trim(0);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +155,9 @@ pub fn run_daemon(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         println!("已有守护进程在运行，本实例退出。");
         return Ok(());
     }
+
+    // ③ 限制 glibc malloc arena 数量，降低多线程下的 RSS 过度预留
+    tune_allocator();
 
     // 每账户缓存上限 = 总上限 / 已启用账户数（0 表示不限制）
     let enabled_count = config.accounts.iter().filter(|a| a.enabled).count();
@@ -807,21 +839,38 @@ fn connect_and_idle(
     let mut known: HashSet<String> = HashSet::new();
     let mut is_first_sync = true;
 
+    // ④ 增量同步缓存：按 (folder, uid) 缓存已解析的**不可变**头部字段
+    // (from, subject, date)。每轮只对新 UID 下载+解析头部；已知 UID 只取 FLAGS 更新
+    // 已读状态。UIDVALIDITY 变化则清掉该文件夹缓存（UID 语义已失效，必须重取）。
+    let mut hdr_cache: HashMap<(String, u32), (String, String, String)> = HashMap::new();
+    let mut uidvalidity: HashMap<String, u32> = HashMap::new();
+
     loop {
         let mut account_mails: Vec<MailInfo> = Vec::new();
         let mut current: HashSet<String> = HashSet::new();
 
         for folder in &folders {
-            // 只读打开该文件夹（examine 不会标记已读）
-            if imap_session.examine(folder).is_err() {
-                continue;
+            // 只读打开该文件夹（examine 不会标记已读），并读取 UIDVALIDITY
+            let mailbox = match imap_session.examine(folder) {
+                Ok(mb) => mb,
+                Err(_) => continue,
+            };
+            // UIDVALIDITY 变化 → 该文件夹的 UID 缓存全部失效，必须重取头部
+            if let Some(uv) = mailbox.uid_validity {
+                if uidvalidity.get(folder) != Some(&uv) {
+                    hdr_cache.retain(|(f, _), _| f != folder);
+                    uidvalidity.insert(folder.clone(), uv);
+                }
             }
+
             // 取该文件夹最近的若干封邮件（已读 + 未读都要），按 UID 从大到小取前 per_account_limit 封
             let all_uids = match imap_session.uid_search("ALL") {
                 Ok(set) => set,
                 Err(_) => continue,
             };
             if all_uids.is_empty() {
+                // 文件夹已空 → 清掉其缓存
+                hdr_cache.retain(|(f, _), _| f != folder);
                 continue;
             }
             let mut uid_vec: Vec<u32> = all_uids.into_iter().collect();
@@ -832,43 +881,94 @@ fn connect_and_idle(
                 uid_vec.len()
             };
             uid_vec.truncate(take);
-            let uid_set = uid_vec
+
+            // 淘汰：窗口滑动 / 已删除 —— 移除不在当前 top-N 里的该文件夹缓存项
+            let keep: HashSet<u32> = uid_vec.iter().copied().collect();
+            hdr_cache.retain(|(f, u), _| f != folder || keep.contains(u));
+
+            // 本轮各 UID 的已读状态（uid -> seen）
+            let mut seen_map: HashMap<u32, bool> = HashMap::new();
+
+            // 1) 新 UID（缓存未命中）：一次取 (FLAGS RFC822.HEADER)，解析头部入缓存
+            let new_uids: Vec<u32> = uid_vec
                 .iter()
-                .map(|u| u.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            // FLAGS 取已读状态；RFC822.HEADER 取头部（examine 只读，不会标记已读）
-            let fetches = imap_session.uid_fetch(uid_set, "(FLAGS RFC822.HEADER)")?;
-
-            for fetch in fetches.iter() {
-                let uid = match fetch.uid {
-                    Some(u) => u,
-                    None => continue,
-                };
-                let header_bytes = match fetch.header() {
-                    Some(h) => h,
-                    None => continue,
-                };
-                let parsed = match mail_parser::MessageParser::default().parse(header_bytes) {
-                    Some(p) => p,
-                    None => continue,
-                };
-
-                let seen = fetch
-                    .flags()
+                .copied()
+                .filter(|u| !hdr_cache.contains_key(&(folder.clone(), *u)))
+                .collect();
+            if !new_uids.is_empty() {
+                let set = new_uids
                     .iter()
-                    .any(|f| matches!(f, imap::types::Flag::Seen));
-                let subject = parsed.subject().unwrap_or("No Subject").to_string();
-                let from = parsed
-                    .from()
-                    .map(format_address)
-                    .unwrap_or_else(|| "Unknown Sender".to_string());
-                // 将邮件时间从发件人时区转换为本地时区再显示
-                let date = parsed
-                    .date()
-                    .and_then(|d| Local.timestamp_opt(d.to_timestamp(), 0).single())
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                    .unwrap_or_else(|| "Unknown Date".to_string());
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let fetches = imap_session.uid_fetch(set, "(FLAGS RFC822.HEADER)")?;
+                for fetch in fetches.iter() {
+                    let uid = match fetch.uid {
+                        Some(u) => u,
+                        None => continue,
+                    };
+                    let seen = fetch
+                        .flags()
+                        .iter()
+                        .any(|f| matches!(f, imap::types::Flag::Seen));
+                    seen_map.insert(uid, seen);
+                    let header_bytes = match fetch.header() {
+                        Some(h) => h,
+                        None => continue,
+                    };
+                    let parsed = match mail_parser::MessageParser::default().parse(header_bytes) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    let subject = parsed.subject().unwrap_or("No Subject").to_string();
+                    let from = parsed
+                        .from()
+                        .map(format_address)
+                        .unwrap_or_else(|| "Unknown Sender".to_string());
+                    // 将邮件时间从发件人时区转换为本地时区再显示
+                    let date = parsed
+                        .date()
+                        .and_then(|d| Local.timestamp_opt(d.to_timestamp(), 0).single())
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "Unknown Date".to_string());
+                    hdr_cache.insert((folder.clone(), uid), (from, subject, date));
+                }
+            }
+
+            // 2) 已知 UID：只取 FLAGS 更新已读状态（省去重复下载/解析头部）
+            let known_uids: Vec<u32> = uid_vec
+                .iter()
+                .copied()
+                .filter(|u| !seen_map.contains_key(u))
+                .collect();
+            if !known_uids.is_empty() {
+                let set = known_uids
+                    .iter()
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let fetches = imap_session.uid_fetch(set, "FLAGS")?;
+                for fetch in fetches.iter() {
+                    if let Some(uid) = fetch.uid {
+                        let seen = fetch
+                            .flags()
+                            .iter()
+                            .any(|f| matches!(f, imap::types::Flag::Seen));
+                        seen_map.insert(uid, seen);
+                    }
+                }
+            }
+
+            // 3) 用缓存头部 + 本轮 FLAGS 组装 MailInfo（按 uid_vec 顺序；任一缺失则跳过）
+            for uid in &uid_vec {
+                let (from, subject, date) = match hdr_cache.get(&(folder.clone(), *uid)) {
+                    Some(v) => v.clone(),
+                    None => continue, // 头部取回失败（例如取回途中被删）
+                };
+                let seen = match seen_map.get(uid) {
+                    Some(s) => *s,
+                    None => continue, // FLAGS 未取到
+                };
 
                 let key = format!("{}\u{1}{}", folder, uid);
                 // known/current 仅跟踪“未读”键，用于新邮件通知去重
@@ -879,7 +979,7 @@ fn connect_and_idle(
                 account_mails.push(MailInfo {
                     account: account.name.clone(),
                     folder: folder.clone(),
-                    uid,
+                    uid: *uid,
                     from: from.clone(),
                     subject: subject.clone(),
                     date,
@@ -918,6 +1018,8 @@ fn connect_and_idle(
         }
         // 状态已更新（可能有新邮件）→ 立即推送给 watch 订阅者，实现零延迟。
         notify_state_changed();
+        // ③ 本轮同步可能下载/解析了一批头部，尖峰后把空闲堆页还给 OS
+        release_free_memory();
 
         known = current;
         is_first_sync = false;
