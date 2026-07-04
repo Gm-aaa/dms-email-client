@@ -69,9 +69,42 @@ impl Translator for NllbLocal {
     }
 }
 
+/// 翻译一段散文文本，同时把其中 4–8 位的独立数字串（验证码）挖出来保持原样，
+/// 不送进 translate()——与 daemon.rs 里 process_text_segment 用的是同一条
+/// `[0-9]+` 正则 + 4..=8 长度判断，两处规则必须一致。
+fn translate_text_preserving_codes(
+    t: &dyn Translator,
+    text: &str,
+    src: &str,
+    tgt: &str,
+) -> Result<String, String> {
+    static DIGIT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let digit_re = DIGIT_RE.get_or_init(|| regex::Regex::new(r"[0-9]+").unwrap());
+
+    let mut out = String::new();
+    let mut last = 0;
+    for m in digit_re.find_iter(text) {
+        let len = m.end() - m.start();
+        if (4..=8).contains(&len) {
+            let chunk = &text[last..m.start()];
+            if !chunk.is_empty() {
+                out.push_str(&t.translate(chunk, src, tgt)?);
+            }
+            out.push_str(m.as_str()); // 验证码原样保留，不送翻译器
+            last = m.end();
+        }
+    }
+    let tail = &text[last..];
+    if !tail.is_empty() {
+        out.push_str(&t.translate(tail, src, tgt)?);
+    }
+    Ok(out)
+}
+
 /// 把纯文本正文翻译成目标语言：用 URL 正则把文本切成【散文段 | URL 段】，只翻散文，
-/// URL 原样保留；4–8 位验证码这类独立数字串也保持不动（NLLB 一般会保留数字，但为
-/// 稳妥仍以整段散文送入——数字不会被改写）。返回**纯文本**，由调用方 body_to_html。
+/// URL 原样保留；每个散文段内部再由 translate_text_preserving_codes 挖出 4–8 位
+/// 验证码保持原样——不再依赖"模型碰巧不改数字"的假设，而是代码层面强制隔离。
+/// 返回**纯文本**，由调用方 body_to_html。
 pub fn translate_prose(
     t: &dyn Translator,
     plain: &str,
@@ -87,7 +120,7 @@ pub fn translate_prose(
     for m in url_re.find_iter(plain) {
         let prose = &plain[last..m.start()];
         if !prose.trim().is_empty() {
-            out.push_str(&t.translate(prose, src, tgt)?);
+            out.push_str(&translate_text_preserving_codes(t, prose, src, tgt)?);
         } else {
             out.push_str(prose);
         }
@@ -96,7 +129,7 @@ pub fn translate_prose(
     }
     let tail = &plain[last..];
     if !tail.trim().is_empty() {
-        out.push_str(&t.translate(tail, src, tgt)?);
+        out.push_str(&translate_text_preserving_codes(t, tail, src, tgt)?);
     } else {
         out.push_str(tail);
     }
@@ -153,5 +186,25 @@ mod tests {
         assert_eq!(translate_prose(&MockTranslator, "", "eng_Latn", "zho_Hans").unwrap(), "");
         let only = translate_prose(&MockTranslator, "https://a.com/x", "eng_Latn", "zho_Hans").unwrap();
         assert_eq!(only, "https://a.com/x");
+    }
+
+    /// 假翻译器：把文本里每个 ASCII 数字都改写成 '9'，用来证明验证码若被送进
+    /// translate() 就会被改写——从而验证 translate_prose 是否真正把验证码排除在外
+    /// （而不是依赖"模型碰巧不改数字"的假设）。
+    struct DigitMangler;
+    impl Translator for DigitMangler {
+        fn translate(&self, text: &str, _src: &str, _tgt: &str) -> Result<String, String> {
+            Ok(text
+                .chars()
+                .map(|c| if c.is_ascii_digit() { '9' } else { c })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn digit_mangling_translator_still_preserves_codes() {
+        let plain = "Your code 482913 expires soon.";
+        let out = translate_prose(&DigitMangler, plain, "eng_Latn", "zho_Hans").unwrap();
+        assert!(out.contains("482913"), "4-8 digit code was sent to translator and mangled: {out}");
     }
 }
