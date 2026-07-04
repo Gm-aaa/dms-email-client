@@ -13,7 +13,9 @@
 //! pre-tokenization 时始终会按 added-vocab 词表切分它们（与
 //! add_special_tokens 开关无关），所以字面量文本能被正确切成对应的 token id。
 
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::sync::Mutex;
 
 use ct2rs::tokenizers::hf::Tokenizer as HfTokenizer;
 use ct2rs::{Config, TranslationOptions, Translator as Ct2Translator};
@@ -163,6 +165,40 @@ pub fn resolve_source_lang(requested: &str, text: &str) -> String {
     code.to_string()
 }
 
+/// 译文缓存键：(account, folder, uid, src, tgt)。五元组而非仅 uid，
+/// 是为了让切换源/目标语言后不会命中旧翻译（陈旧结果）。
+pub type TransKey = (String, String, u32, String, String);
+
+/// 译文内存缓存：容量上限 + FIFO 淘汰。不落盘。
+pub struct TransCache {
+    inner: Mutex<(HashMap<TransKey, String>, VecDeque<TransKey>)>,
+    cap: usize,
+}
+
+impl TransCache {
+    pub fn new(cap: usize) -> TransCache {
+        TransCache {
+            inner: Mutex::new((HashMap::new(), VecDeque::new())),
+            cap: cap.max(1),
+        }
+    }
+    pub fn get(&self, key: &TransKey) -> Option<String> {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.0.get(key).cloned()
+    }
+    pub fn put(&self, key: TransKey, html: String) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.0.insert(key.clone(), html).is_none() {
+            g.1.push_back(key);
+        }
+        while g.1.len() > self.cap {
+            if let Some(old) = g.1.pop_front() {
+                g.0.remove(&old);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod spike_tests {
     use super::*;
@@ -246,5 +282,20 @@ mod tests {
         assert_eq!(resolve_source_lang("auto", "Это предложение на русском языке для проверки."), "rus_Cyrl");
         // 无法可靠判断时回退英语
         assert_eq!(resolve_source_lang("auto", "12345 !!! ???"), "eng_Latn");
+    }
+
+    #[test]
+    fn cache_hit_miss_and_eviction() {
+        let c = TransCache::new(2);
+        let k1: TransKey = ("a".into(), "INBOX".into(), 1, "eng_Latn".into(), "zho_Hans".into());
+        let k2: TransKey = ("a".into(), "INBOX".into(), 2, "eng_Latn".into(), "zho_Hans".into());
+        let k3: TransKey = ("a".into(), "INBOX".into(), 3, "eng_Latn".into(), "zho_Hans".into());
+        assert_eq!(c.get(&k1), None);
+        c.put(k1.clone(), "one".into());
+        assert_eq!(c.get(&k1), Some("one".into()));
+        c.put(k2.clone(), "two".into());
+        c.put(k3.clone(), "three".into()); // 超容量，淘汰最早的 k1
+        assert_eq!(c.get(&k1), None, "k1 should be evicted");
+        assert_eq!(c.get(&k3), Some("three".into()));
     }
 }
