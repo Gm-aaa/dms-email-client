@@ -136,6 +136,33 @@ pub fn translate_prose(
     Ok(out)
 }
 
+/// 把「auto 或显式语言码」解析为 NLLB(FLORES-200) 源语言码。
+/// auto 时用 whatlang 检测；不可靠或未映射则回退 eng_Latn。
+pub fn resolve_source_lang(requested: &str, text: &str) -> String {
+    if requested != "auto" {
+        return requested.to_string();
+    }
+    use whatlang::Lang;
+    let info = match whatlang::detect(text) {
+        Some(i) if i.is_reliable() => i,
+        _ => return "eng_Latn".to_string(),
+    };
+    let code = match info.lang() {
+        Lang::Eng => "eng_Latn",
+        Lang::Cmn => "zho_Hans",
+        Lang::Rus => "rus_Cyrl",
+        Lang::Jpn => "jpn_Jpan",
+        Lang::Kor => "kor_Hang",
+        Lang::Fra => "fra_Latn",
+        Lang::Deu => "deu_Latn",
+        Lang::Spa => "spa_Latn",
+        Lang::Por => "por_Latn",
+        Lang::Ita => "ita_Latn",
+        _ => "eng_Latn",
+    };
+    code.to_string()
+}
+
 #[cfg(test)]
 mod spike_tests {
     use super::*;
@@ -206,5 +233,18 @@ mod tests {
         let plain = "Your code 482913 expires soon.";
         let out = translate_prose(&DigitMangler, plain, "eng_Latn", "zho_Hans").unwrap();
         assert!(out.contains("482913"), "4-8 digit code was sent to translator and mangled: {out}");
+    }
+
+    #[test]
+    fn explicit_source_is_passthrough() {
+        assert_eq!(resolve_source_lang("rus_Cyrl", "irrelevant"), "rus_Cyrl");
+    }
+
+    #[test]
+    fn auto_detects_common_langs() {
+        assert_eq!(resolve_source_lang("auto", "This is clearly an English sentence about email."), "eng_Latn");
+        assert_eq!(resolve_source_lang("auto", "Это предложение на русском языке для проверки."), "rus_Cyrl");
+        // 无法可靠判断时回退英语
+        assert_eq!(resolve_source_lang("auto", "12345 !!! ???"), "eng_Latn");
     }
 }
