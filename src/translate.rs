@@ -16,11 +16,11 @@
 use std::path::Path;
 
 use ct2rs::tokenizers::hf::Tokenizer as HfTokenizer;
-use ct2rs::{Config, TranslationOptions, Translator};
+use ct2rs::{Config, TranslationOptions, Translator as Ct2Translator};
 
 /// 本地 NLLB 翻译器。持有已加载的 CTranslate2 模型 + 分词器。
 pub struct NllbLocal {
-    translator: Translator<HfTokenizer>,
+    translator: Ct2Translator<HfTokenizer>,
 }
 
 impl NllbLocal {
@@ -32,7 +32,7 @@ impl NllbLocal {
         // "</s> <src_lang>" 后缀，见上方模块说明。
         tokenizer.disable_spacial_token();
 
-        let translator = Translator::with_tokenizer(model_dir, tokenizer, &Config::default())
+        let translator = Ct2Translator::with_tokenizer(model_dir, tokenizer, &Config::default())
             .map_err(|e| format!("加载 NLLB 模型失败: {e}"))?;
         Ok(NllbLocal { translator })
     }
@@ -58,6 +58,51 @@ impl NllbLocal {
     }
 }
 
+/// 翻译后端抽象（薄）。仅为可测试性与接缝，本期只有 NllbLocal 一个实现。
+pub trait Translator {
+    fn translate(&self, text: &str, src: &str, tgt: &str) -> Result<String, String>;
+}
+
+impl Translator for NllbLocal {
+    fn translate(&self, text: &str, src: &str, tgt: &str) -> Result<String, String> {
+        self.translate_one(text, src, tgt)
+    }
+}
+
+/// 把纯文本正文翻译成目标语言：用 URL 正则把文本切成【散文段 | URL 段】，只翻散文，
+/// URL 原样保留；4–8 位验证码这类独立数字串也保持不动（NLLB 一般会保留数字，但为
+/// 稳妥仍以整段散文送入——数字不会被改写）。返回**纯文本**，由调用方 body_to_html。
+pub fn translate_prose(
+    t: &dyn Translator,
+    plain: &str,
+    src: &str,
+    tgt: &str,
+) -> Result<String, String> {
+    static URL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let url_re =
+        URL_RE.get_or_init(|| regex::Regex::new(r#"<?(https?://[^\s<>"']+)>?"#).unwrap());
+
+    let mut out = String::new();
+    let mut last = 0;
+    for m in url_re.find_iter(plain) {
+        let prose = &plain[last..m.start()];
+        if !prose.trim().is_empty() {
+            out.push_str(&t.translate(prose, src, tgt)?);
+        } else {
+            out.push_str(prose);
+        }
+        out.push_str(m.as_str()); // URL 原样
+        last = m.end();
+    }
+    let tail = &plain[last..];
+    if !tail.trim().is_empty() {
+        out.push_str(&t.translate(tail, src, tgt)?);
+    } else {
+        out.push_str(tail);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod spike_tests {
     use super::*;
@@ -75,5 +120,38 @@ mod spike_tests {
         println!("translated = {out:?}");
         assert!(!out.trim().is_empty(), "empty translation");
         assert!(out.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)), "no Chinese chars: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 假翻译器：把每个散文段包上「<译>...</译>」，便于断言哪些段被翻译。
+    struct MockTranslator;
+    impl Translator for MockTranslator {
+        fn translate(&self, text: &str, _src: &str, _tgt: &str) -> Result<String, String> {
+            Ok(format!("<译>{text}</译>"))
+        }
+    }
+
+    #[test]
+    fn keeps_urls_and_codes_untranslated() {
+        let plain = "Click https://gog.com/deal now. Code 482913 expires.";
+        let out = translate_prose(&MockTranslator, plain, "eng_Latn", "zho_Hans").unwrap();
+        // URL 与验证码原样保留
+        assert!(out.contains("https://gog.com/deal"), "url mangled: {out}");
+        assert!(out.contains("482913"), "code mangled: {out}");
+        // 散文被翻译（出现译标记）
+        assert!(out.contains("<译>"), "prose not translated: {out}");
+        // URL 不在译标记内部
+        assert!(!out.contains("<译>https"), "url got translated: {out}");
+    }
+
+    #[test]
+    fn empty_and_url_only() {
+        assert_eq!(translate_prose(&MockTranslator, "", "eng_Latn", "zho_Hans").unwrap(), "");
+        let only = translate_prose(&MockTranslator, "https://a.com/x", "eng_Latn", "zho_Hans").unwrap();
+        assert_eq!(only, "https://a.com/x");
     }
 }
