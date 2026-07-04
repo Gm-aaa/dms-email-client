@@ -43,6 +43,16 @@ enum Commands {
         #[arg(default_value = "")]
         account: String,
     },
+    /// Translate an email body via the daemon (offline NLLB)
+    Translate {
+        account: String,
+        folder: String,
+        uid: String,
+        /// NLLB source lang code, or "auto"
+        src: String,
+        /// NLLB target lang code (e.g. zho_Hans)
+        tgt: String,
+    },
     /// Manage configuration
     Config {
         #[command(subcommand)]
@@ -93,6 +103,9 @@ fn main() {
         }
         Some(Commands::ReadAll { account }) => {
             send_command(&format!("read_all\t{}", account));
+        }
+        Some(Commands::Translate { account, folder, uid, src, tgt }) => {
+            send_command(&format!("translate\t{account}\t{folder}\t{uid}\t{src}\t{tgt}"));
         }
         Some(Commands::Config { action }) => {
             match action {

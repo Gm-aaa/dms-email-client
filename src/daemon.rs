@@ -14,6 +14,21 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 
+/// 翻译功能的共享单例：懒加载的模型管理器（含空闲卸载）与内存翻译缓存。
+fn model_manager() -> &'static std::sync::Arc<crate::translate::ModelManager> {
+    static MM: OnceLock<std::sync::Arc<crate::translate::ModelManager>> = OnceLock::new();
+    MM.get_or_init(|| {
+        let mm = std::sync::Arc::new(crate::translate::ModelManager::new());
+        mm.start_idle_unloader();
+        mm
+    })
+}
+
+fn trans_cache() -> &'static crate::translate::TransCache {
+    static TC: OnceLock<crate::translate::TransCache> = OnceLock::new();
+    TC.get_or_init(|| crate::translate::TransCache::new(200))
+}
+
 /// IPC socket 路径：优先 `$XDG_RUNTIME_DIR`（每用户私有、随登录会话清理），
 /// 回退到系统临时目录并带上用户名，避免多用户在共享目录下冲突。
 pub fn socket_path() -> String {
@@ -247,6 +262,10 @@ fn handle_client(
             let resp = fetch_body(accounts, cache_dir, account, folder, uid);
             let _ = stream.write_all(resp.as_bytes());
         }
+        ["translate", account, folder, uid, src, tgt] => {
+            let resp = fetch_translation(accounts, account, folder, uid, src, tgt);
+            let _ = stream.write_all(resp.as_bytes());
+        }
         ["read", account, folder, uid] => {
             let resp = mark_read(accounts, state, account, folder, uid);
             let _ = stream.write_all(resp.as_bytes());
@@ -358,6 +377,25 @@ fn body_cache_path(cache_dir: &str, account: &str, folder: &str, uid: &str) -> s
         .join(format!("{}.v3.json", uid))
 }
 
+/// 连接账户、只读打开文件夹、按 UID 取原始邮件并解析。供 fetch_body 与 translate 复用。
+fn fetch_raw_message(
+    account: &Account,
+    folder: &str,
+    uid: &str,
+) -> Result<mail_parser::Message<'static>, Box<dyn std::error::Error>> {
+    let mut session = connect_session(account)?;
+    session.examine(folder)?;
+    let fetches = session.uid_fetch(uid, "BODY.PEEK[]")?;
+    let fetch = fetches.iter().next().ok_or("未找到该邮件")?;
+    let raw = fetch.body().ok_or("邮件无正文数据")?.to_vec();
+    let _ = session.logout();
+    let msg = mail_parser::MessageParser::default()
+        .parse(&raw)
+        .ok_or("邮件解析失败")?;
+    // 解析借用 raw；转为 owned 以便跨函数返回
+    Ok(msg.into_owned())
+}
+
 /// 按需获取某封邮件的正文（只读打开，不会标记已读）；优先读磁盘缓存
 fn fetch_body(
     accounts: &[Account],
@@ -380,14 +418,7 @@ fn fetch_body(
     };
 
     let run = || -> Result<String, Box<dyn std::error::Error>> {
-        let mut session = connect_session(account)?;
-        session.examine(folder)?; // 只读，避免标记已读
-        let fetches = session.uid_fetch(uid, "BODY.PEEK[]")?;
-        let fetch = fetches.iter().next().ok_or("未找到该邮件")?;
-        let raw = fetch.body().ok_or("邮件无正文数据")?;
-        let msg = mail_parser::MessageParser::default()
-            .parse(raw)
-            .ok_or("邮件解析失败")?;
+        let msg = fetch_raw_message(account, folder, uid)?;
 
         // 正文先取纯文本，再转成可渲染的 HTML：URL → 可点击「🔗 域名 + ⧉ 复制」，
         // 4–8 位验证码 → 可点击复制。前端 TextEdit(RichText) 直接显示。
@@ -400,7 +431,6 @@ fn fetch_body(
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_default();
 
-        let _ = session.logout();
         Ok(serde_json::json!({
             "ok": true,
             "from": from,
@@ -423,6 +453,43 @@ fn fetch_body(
         }
         Err(e) => json_err(&e.to_string()),
     }
+}
+
+/// 取信→提取纯文本→(auto 检测源语言)→查缓存→翻译散文(保留 URL)→body_to_html→缓存。
+fn fetch_translation(
+    accounts: &[Account],
+    account_name: &str,
+    folder: &str,
+    uid: &str,
+    src_req: &str,
+    tgt: &str,
+) -> String {
+    let account = match accounts.iter().find(|a| a.name == account_name) {
+        Some(a) => a,
+        None => return json_err("账户不存在"),
+    };
+    let run = || -> Result<String, Box<dyn std::error::Error>> {
+        let msg = fetch_raw_message(account, folder, uid)?;
+        let plain = extract_body(&msg);
+        let src = crate::translate::resolve_source_lang(src_req, &plain);
+        let key: crate::translate::TransKey = (
+            account_name.to_string(),
+            folder.to_string(),
+            uid.parse::<u32>().unwrap_or(0),
+            src.clone(),
+            tgt.to_string(),
+        );
+        if let Some(html) = trans_cache().get(&key) {
+            return Ok(serde_json::json!({ "ok": true, "body": html }).to_string());
+        }
+        let translated_plain = model_manager()
+            .with_translator(|t| crate::translate::translate_prose(t, &plain, &src, tgt))
+            .map_err(|e| e.to_string())??;
+        let html = body_to_html(&translated_plain);
+        trans_cache().put(key, html.clone());
+        Ok(serde_json::json!({ "ok": true, "body": html }).to_string())
+    };
+    run().unwrap_or_else(|e| json_err(&e.to_string()))
 }
 
 /// 标记某封邮件为已读（设置 \Seen 标志），并从守护进程状态中立即移除该邮件
