@@ -66,6 +66,14 @@ PluginComponent {
     property string detailDate: ""
     property string detailBody: ""
 
+    // Translation state (Task 7; enabled by pluginData.translateEnabled from Task 8)
+    readonly property bool translateEnabled: (pluginData && pluginData.translateEnabled) === true
+    readonly property string translateSourceLang: (pluginData && pluginData.translateSourceLang) ? pluginData.translateSourceLang : "auto"
+    readonly property string translateTargetLang: (pluginData && pluginData.translateTargetLang) ? pluginData.translateTargetLang : "zho_Hans"
+    property string detailBodyZh: ""      // 译文 HTML（空=未翻译）
+    property bool showTranslated: false   // 当前是否显示译文
+    property bool translating: false
+
     function openMail(mail) {
         root.selectedMail = mail;
         root.detailLoading = true;
@@ -74,6 +82,9 @@ PluginComponent {
         root.detailSubject = mail.subject || "";
         root.detailDate = mail.date || "";
         root.detailBody = "";
+        root.detailBodyZh = "";
+        root.showTranslated = false;
+        root.translating = false;
         bodyProcess.aAccount = mail.account;
         bodyProcess.aFolder = mail.folder || "INBOX";
         bodyProcess.aUid = String(mail.uid);
@@ -166,6 +177,33 @@ PluginComponent {
                     }
                 } catch (e) {
                     root.detailError = "解析失败";
+                }
+            }
+        }
+    }
+
+    // Translate the full body of the currently-open mail (Task 7; requires Task 6 daemon support)
+    Process {
+        id: translateProcess
+        property string aAccount: ""
+        property string aFolder: ""
+        property string aUid: ""
+        command: [root.binPath, "translate", aAccount, aFolder, aUid,
+                  root.translateSourceLang, root.translateTargetLang]
+        running: false
+        stdout: StdioCollector {
+            onStreamFinished: {
+                root.translating = false;
+                try {
+                    let d = JSON.parse(this.text);
+                    if (d.ok) {
+                        root.detailBodyZh = d.body || "";
+                        root.showTranslated = true;
+                    } else {
+                        root.showToast("翻译失败：" + (d.error || ""));
+                    }
+                } catch (e) {
+                    root.showToast("翻译失败");
                 }
             }
         }
@@ -853,6 +891,41 @@ PluginComponent {
                     wrapMode: Text.WordWrap
                 }
 
+                // 翻译按钮：仅在设置中启用且正文已加载成功时显示（Task 8 提供 translateEnabled 开关）
+                Rectangle {
+                    visible: root.translateEnabled && !root.detailLoading && root.detailError === ""
+                    width: tLabel.implicitWidth + Theme.spacingM * 2
+                    height: Theme.iconSize * 1.4
+                    radius: Theme.cornerRadius
+                    color: tArea.containsMouse ? Theme.surfaceContainerHighest : Theme.surfaceContainer
+                    StyledText {
+                        id: tLabel
+                        anchors.centerIn: parent
+                        text: root.translating ? "翻译中…（首次需下载模型，请稍候）"
+                              : (root.showTranslated ? "原文" : "翻译")
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: Theme.surfaceText
+                    }
+                    MouseArea {
+                        id: tArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            if (root.translating) return;
+                            if (root.showTranslated) { root.showTranslated = false; return; }
+                            if (root.detailBodyZh !== "") { root.showTranslated = true; return; }
+                            // 尚未翻译：触发 daemon
+                            root.translating = true;
+                            translateProcess.aAccount = root.selectedMail.account;
+                            translateProcess.aFolder = root.selectedMail.folder || "INBOX";
+                            translateProcess.aUid = String(root.selectedMail.uid);
+                            translateProcess.running = false;
+                            translateProcess.running = true;
+                        }
+                    }
+                }
+
                 DankFlickable {
                     visible: !root.detailLoading && root.detailError === ""
                     width: parent.width
@@ -865,7 +938,8 @@ PluginComponent {
                     TextEdit {
                         id: bodyText
                         width: parent.width
-                        text: root.detailBody.replace(/<a /g, '<a style="color:' + String(Theme.primary) + ';text-decoration:none" ')
+                        text: (root.showTranslated ? root.detailBodyZh : root.detailBody)
+                              .replace(/<a /g, '<a style="color:' + String(Theme.primary) + ';text-decoration:none" ')
                         textFormat: TextEdit.RichText
                         readOnly: true
                         selectByMouse: true
