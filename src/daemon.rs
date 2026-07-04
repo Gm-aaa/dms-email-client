@@ -77,7 +77,7 @@ fn tune_allocator() {
 
 /// 把空闲堆页归还给 OS，用于同步尖峰（下载/解析一批头部）之后收敛 RSS。
 /// glibc 专有，其他平台 no-op。
-fn release_free_memory() {
+pub(crate) fn release_free_memory() {
     #[cfg(target_env = "gnu")]
     {
         extern "C" {

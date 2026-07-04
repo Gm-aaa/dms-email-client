@@ -14,8 +14,9 @@
 //! add_special_tokens 开关无关），所以字面量文本能被正确切成对应的 token id。
 
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ct2rs::tokenizers::hf::Tokenizer as HfTokenizer;
 use ct2rs::{Config, TranslationOptions, Translator as Ct2Translator};
@@ -199,6 +200,98 @@ impl TransCache {
     }
 }
 
+/// 模型的持久化存放目录：`$XDG_DATA_HOME/dms-email-client/models/nllb-200-distilled-600M`
+/// （无 XDG 时退化到当前目录下同名相对路径）。
+pub fn model_dir() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("dms-email-client/models/nllb-200-distilled-600M")
+}
+
+/// ensure_model 需要落地的全部文件：CT2 模型本体 + HuggingFace 分词器全套。
+/// NllbLocal::load 用 ct2rs 的 HfTokenizer 读 tokenizer.json，所以分词器相关
+/// 文件（tokenizer.json / tokenizer_config.json / special_tokens_map.json /
+/// sentencepiece.bpe.model）缺一不可，不能只下 CT2 模型文件。
+const MODEL_FILES: [&str; 7] = [
+    "config.json",
+    "model.bin",
+    "sentencepiece.bpe.model",
+    "shared_vocabulary.txt",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
+    "tokenizer.json",
+];
+
+/// 确保模型就绪：缺失则从 HuggingFace 下载社区预转换好的 CT2 (int8) 版模型 +
+/// 配套分词器文件到 model_dir()，避免运行时依赖 Python 转换脚本。
+/// 若 model.bin 与 tokenizer.json 均已存在，视为已就绪，直接跳过下载。
+pub fn ensure_model() -> Result<PathBuf, String> {
+    let dir = model_dir();
+    let model_bin = dir.join("model.bin");
+    let tokenizer_json = dir.join("tokenizer.json");
+    if model_bin.exists() && tokenizer_json.exists() {
+        return Ok(dir);
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("建目录失败: {e}"))?;
+    // 社区预转换好的 CT2 int8 仓库（已验证可用，含分词器全套文件）。
+    let repo = "JustFrederik/nllb-200-distilled-600M-ct2-int8";
+    let api = hf_hub::api::sync::Api::new().map_err(|e| format!("hf-hub 初始化失败: {e}"))?;
+    let r = api.model(repo.to_string());
+    for f in MODEL_FILES {
+        let got = r.get(f).map_err(|e| format!("下载 {f} 失败: {e}"))?;
+        std::fs::copy(&got, dir.join(f)).map_err(|e| format!("落盘 {f} 失败: {e}"))?;
+    }
+    Ok(dir)
+}
+
+/// 管理 NLLB 模型的懒加载与空闲卸载，保持 daemon 常驻内存精简：
+/// 首次使用时才 ensure_model()+load()，空闲超过 5 分钟由后台线程卸载。
+pub struct ModelManager {
+    // (已加载的翻译器, 上次使用时刻)
+    slot: Mutex<(Option<NllbLocal>, Instant)>,
+}
+
+impl ModelManager {
+    pub fn new() -> ModelManager {
+        ModelManager {
+            slot: Mutex::new((None, Instant::now())),
+        }
+    }
+
+    /// 取用翻译器执行 f；模型未加载则先 ensure_model()+load。执行后更新 last-used。
+    pub fn with_translator<R>(&self, f: impl FnOnce(&NllbLocal) -> R) -> Result<R, String> {
+        let mut g = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if g.0.is_none() {
+            let dir = ensure_model()?;
+            g.0 = Some(NllbLocal::load(&dir)?);
+        }
+        g.1 = Instant::now();
+        let t = g.0.as_ref().unwrap();
+        Ok(f(t))
+    }
+
+    /// 后台线程：每 60 秒检查一次，空闲超过 5 分钟则卸载模型并把内存归还 OS。
+    pub fn start_idle_unloader(self: &Arc<ModelManager>) {
+        let me = Arc::clone(self);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(60));
+            let mut g = me.slot.lock().unwrap_or_else(|e| e.into_inner());
+            if g.0.is_some() && g.1.elapsed() > Duration::from_secs(5 * 60) {
+                g.0 = None; // Drop 卸载模型
+                drop(g);
+                crate::daemon::release_free_memory();
+                println!("[translate] 空闲卸载 NLLB 模型，归还内存");
+            }
+        });
+    }
+}
+
+impl Default for ModelManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod spike_tests {
     use super::*;
@@ -215,6 +308,21 @@ mod spike_tests {
         let out = t.translate_one("Hello, world.", "eng_Latn", "zho_Hans").unwrap();
         println!("translated = {out:?}");
         assert!(!out.trim().is_empty(), "empty translation");
+        assert!(out.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)), "no Chinese chars: {out:?}");
+    }
+
+    /// ModelManager 端到端：ensure_model 走跳过下载路径（模型已在本机就绪）+
+    /// lazy load + 实际翻译一句。默认忽略，手动运行：
+    /// cargo test --release model_manager_lazy_load -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn model_manager_lazy_load() {
+        let mm = ModelManager::new();
+        let out = mm
+            .with_translator(|t| t.translate_one("Hello, world.", "eng_Latn", "zho_Hans"))
+            .expect("with_translator")
+            .expect("translate_one");
+        println!("translated = {out:?}");
         assert!(out.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)), "no Chinese chars: {out:?}");
     }
 }
