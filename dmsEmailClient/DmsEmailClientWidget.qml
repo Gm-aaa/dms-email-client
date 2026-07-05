@@ -70,6 +70,9 @@ PluginComponent {
     readonly property bool translateEnabled: (pluginData && pluginData.translateEnabled) === true
     readonly property string translateSourceLang: (pluginData && pluginData.translateSourceLang) ? pluginData.translateSourceLang : "auto"
     readonly property string translateTargetLang: (pluginData && pluginData.translateTargetLang) ? pluginData.translateTargetLang : "zho_Hans"
+    // 翻译引擎：google（默认）/ deeplx / nllb（本地离线）
+    readonly property string translateEngine: (pluginData && pluginData.translateEngine) ? pluginData.translateEngine : "google"
+    readonly property string deeplxUrl: (pluginData && pluginData.deeplxUrl) ? pluginData.deeplxUrl : ""
     property string detailBodyZh: ""      // 译文 HTML（空=未翻译）
     property bool showTranslated: false   // 当前是否显示译文
     property bool translating: false
@@ -189,7 +192,8 @@ PluginComponent {
         property string aFolder: ""
         property string aUid: ""
         command: [root.binPath, "translate", aAccount, aFolder, aUid,
-                  root.translateSourceLang, root.translateTargetLang]
+                  root.translateSourceLang, root.translateTargetLang,
+                  root.translateEngine, root.deeplxUrl]
         running: false
         stdout: StdioCollector {
             onStreamFinished: {

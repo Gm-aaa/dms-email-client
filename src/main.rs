@@ -43,7 +43,7 @@ enum Commands {
         #[arg(default_value = "")]
         account: String,
     },
-    /// Translate an email body via the daemon (offline NLLB)
+    /// Translate an email body via the daemon
     Translate {
         account: String,
         folder: String,
@@ -52,6 +52,12 @@ enum Commands {
         src: String,
         /// NLLB target lang code (e.g. zho_Hans)
         tgt: String,
+        /// Engine: nllb (offline) | google | deeplx
+        #[arg(default_value = "nllb")]
+        engine: String,
+        /// DeepLX endpoint URL (only for engine=deeplx)
+        #[arg(default_value = "")]
+        deeplx_url: String,
     },
     /// Manage configuration
     Config {
@@ -104,8 +110,10 @@ fn main() {
         Some(Commands::ReadAll { account }) => {
             send_command(&format!("read_all\t{}", account));
         }
-        Some(Commands::Translate { account, folder, uid, src, tgt }) => {
-            send_command(&format!("translate\t{account}\t{folder}\t{uid}\t{src}\t{tgt}"));
+        Some(Commands::Translate { account, folder, uid, src, tgt, engine, deeplx_url }) => {
+            send_command(&format!(
+                "translate\t{account}\t{folder}\t{uid}\t{src}\t{tgt}\t{engine}\t{deeplx_url}"
+            ));
         }
         Some(Commands::Config { action }) => {
             match action {

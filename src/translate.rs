@@ -240,9 +240,108 @@ pub fn resolve_source_lang(requested: &str, text: &str) -> String {
     code.to_string()
 }
 
-/// 译文缓存键：(account, folder, uid, src, tgt)。五元组而非仅 uid，
-/// 是为了让切换源/目标语言后不会命中旧翻译（陈旧结果）。
-pub type TransKey = (String, String, u32, String, String);
+// ───────────────────────── 在线翻译后端（Google / DeepLX）─────────────────────────
+//
+// 与本地 NLLB 不同：在线引擎把**整段正文**一次性发出去翻译（少量 HTTP 调用），再由
+// 调用方 body_to_html 重新识别 URL/验证码并 linkify。正文会离开本机（隐私），需联网。
+
+/// 目标语言 FLORES-200 码 → (Google ISO 码, DeepL 码)。未知则回退中文。
+fn map_target_lang(flores: &str) -> (&'static str, &'static str) {
+    match flores {
+        "zho_Hans" => ("zh-CN", "ZH"),
+        "zho_Hant" => ("zh-TW", "ZH"),
+        "eng_Latn" => ("en", "EN"),
+        "jpn_Jpan" => ("ja", "JA"),
+        "kor_Hang" => ("ko", "KO"),
+        "rus_Cyrl" => ("ru", "RU"),
+        "fra_Latn" => ("fr", "FR"),
+        "deu_Latn" => ("de", "DE"),
+        "spa_Latn" => ("es", "ES"),
+        "por_Latn" => ("pt", "PT"),
+        "ita_Latn" => ("it", "IT"),
+        _ => ("zh-CN", "ZH"),
+    }
+}
+
+/// 把文本按 max 字符上限、沿行边界切块（Google GET 的 q 参数有长度限制）。
+fn split_by_chars(text: &str, max: usize) -> Vec<String> {
+    if text.chars().count() <= max {
+        return vec![text.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for line in text.split_inclusive('\n') {
+        if !cur.is_empty() && cur.chars().count() + line.chars().count() > max {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.push_str(line);
+        if cur.chars().count() > max {
+            out.push(std::mem::take(&mut cur)); // 单行本身超长也直接成块
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Google 免费翻译端点（source 自动检测）。整段正文按 ~4000 字分块后逐块请求、拼回。
+pub fn translate_google(plain: &str, tgt_flores: &str) -> Result<String, String> {
+    let (tl, _) = map_target_lang(tgt_flores);
+    let mut out = String::new();
+    for chunk in split_by_chars(plain, 4000) {
+        if chunk.trim().is_empty() {
+            out.push_str(&chunk);
+            continue;
+        }
+        let resp = ureq::get("https://translate.googleapis.com/translate_a/single")
+            .query("client", "gtx")
+            .query("sl", "auto")
+            .query("tl", tl)
+            .query("dt", "t")
+            .query("q", &chunk)
+            .call()
+            .map_err(|e| format!("Google 翻译请求失败: {e}"))?;
+        let v: serde_json::Value = resp
+            .into_json()
+            .map_err(|e| format!("解析 Google 响应失败: {e}"))?;
+        // 响应形如 [[[译文, 原文, ...], ...], ...]，拼接第一维里每段的译文
+        if let Some(segs) = v.get(0).and_then(|s| s.as_array()) {
+            for seg in segs {
+                if let Some(t) = seg.get(0).and_then(|x| x.as_str()) {
+                    out.push_str(t);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 自托管 DeepLX 翻译（source 自动检测）。POST 整段正文，取响应 data 字段。
+pub fn translate_deeplx(url: &str, plain: &str, tgt_flores: &str) -> Result<String, String> {
+    if url.trim().is_empty() {
+        return Err("未配置 DeepLX 地址".to_string());
+    }
+    let (_, tl) = map_target_lang(tgt_flores);
+    let resp = ureq::post(url)
+        .send_json(serde_json::json!({
+            "text": plain,
+            "source_lang": "auto",
+            "target_lang": tl,
+        }))
+        .map_err(|e| format!("DeepLX 请求失败: {e}"))?;
+    let v: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("解析 DeepLX 响应失败: {e}"))?;
+    v.get("data")
+        .and_then(|d| d.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("DeepLX 响应无 data 字段: {v}"))
+}
+
+/// 译文缓存键：(account, folder, uid, engine, src, tgt)。含 engine/src/tgt，
+/// 是为了让切换引擎或源/目标语言后不会命中旧翻译（陈旧结果）。
+pub type TransKey = (String, String, u32, String, String, String);
 
 /// 译文内存缓存：容量上限 + FIFO 淘汰。不落盘。
 pub struct TransCache {
@@ -568,9 +667,9 @@ mod tests {
     #[test]
     fn cache_hit_miss_and_eviction() {
         let c = TransCache::new(2);
-        let k1: TransKey = ("a".into(), "INBOX".into(), 1, "eng_Latn".into(), "zho_Hans".into());
-        let k2: TransKey = ("a".into(), "INBOX".into(), 2, "eng_Latn".into(), "zho_Hans".into());
-        let k3: TransKey = ("a".into(), "INBOX".into(), 3, "eng_Latn".into(), "zho_Hans".into());
+        let k1: TransKey = ("a".into(), "INBOX".into(), 1, "nllb".into(), "eng_Latn".into(), "zho_Hans".into());
+        let k2: TransKey = ("a".into(), "INBOX".into(), 2, "nllb".into(), "eng_Latn".into(), "zho_Hans".into());
+        let k3: TransKey = ("a".into(), "INBOX".into(), 3, "nllb".into(), "eng_Latn".into(), "zho_Hans".into());
         assert_eq!(c.get(&k1), None);
         c.put(k1.clone(), "one".into());
         assert_eq!(c.get(&k1), Some("one".into()));

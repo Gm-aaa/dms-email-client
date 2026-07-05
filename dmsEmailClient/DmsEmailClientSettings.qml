@@ -237,8 +237,20 @@ PluginSettings {
     ToggleSetting {
         settingKey: "translateEnabled"
         label: "启用翻译"
-        description: "在邮件详情页显示翻译按钮。首次翻译需联网下载约 600MB 离线模型（存于 ~/.local/share/dms-email-client/models），之后完全离线。"
+        description: "在邮件详情页显示翻译按钮。可选在线引擎（快）或本地离线模型。"
         defaultValue: false
+    }
+
+    SelectionSetting {
+        settingKey: "translateEngine"
+        label: "翻译引擎"
+        description: "Google / DeepLX：联网、秒级、质量好，但正文会发送到外部服务。本地 NLLB：完全离线、隐私，但 CPU 上较慢（首次需联网下载约 600MB 模型到 ~/.local/share/dms-email-client/models）。"
+        options: [
+            { label: "Google 翻译（在线）", value: "google" },
+            { label: "DeepLX（在线，自托管）", value: "deeplx" },
+            { label: "本地 NLLB（离线）", value: "nllb" }
+        ]
+        defaultValue: "google"
     }
 
     SelectionSetting {
@@ -267,6 +279,14 @@ PluginSettings {
             { label: "日语", value: "jpn_Jpan" }
         ]
         defaultValue: "zho_Hans"
+    }
+
+    StringSetting {
+        settingKey: "deeplxUrl"
+        label: "DeepLX 地址"
+        description: "仅当引擎选 DeepLX 时使用。填你自托管/公共 DeepLX 的完整 translate 接口地址（key 若有可直接放在路径里）。"
+        placeholder: "https://api.deeplx.org/<key>/translate"
+        defaultValue: ""
     }
 
     // ── Account Management Section ──

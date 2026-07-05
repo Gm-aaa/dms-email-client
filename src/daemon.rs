@@ -262,8 +262,9 @@ fn handle_client(
             let resp = fetch_body(accounts, cache_dir, account, folder, uid);
             let _ = stream.write_all(resp.as_bytes());
         }
-        ["translate", account, folder, uid, src, tgt] => {
-            let resp = fetch_translation(accounts, account, folder, uid, src, tgt);
+        ["translate", account, folder, uid, src, tgt, engine, deeplx_url] => {
+            let resp =
+                fetch_translation(accounts, account, folder, uid, src, tgt, engine, deeplx_url);
             let _ = stream.write_all(resp.as_bytes());
         }
         ["read", account, folder, uid] => {
@@ -463,18 +464,20 @@ fn fetch_translation(
     uid: &str,
     src_req: &str,
     tgt: &str,
+    engine: &str,
+    deeplx_url: &str,
 ) -> String {
     let account = match accounts.iter().find(|a| a.name == account_name) {
         Some(a) => a,
         None => return json_err("账户不存在"),
     };
-    // 缓存键用**请求值** src_req（如字面量 "auto"），这样命中检查可以在联网取信
-    // **之前**完成 —— 同一封邮件、同样的 src_req/tgt，译文缓存命中即直接返回，省掉
-    // 每次约 2s 的 IMAP 原文重取。
+    // 缓存键含 engine + 请求值 src_req，命中检查在联网取信**之前**完成——同一封邮件、
+    // 同样的引擎/语言，译文缓存命中即直接返回，省掉每次约 2s 的 IMAP 原文重取。
     let key: crate::translate::TransKey = (
         account_name.to_string(),
         folder.to_string(),
         uid.parse::<u32>().unwrap_or(0),
+        engine.to_string(),
         src_req.to_string(),
         tgt.to_string(),
     );
@@ -484,17 +487,24 @@ fn fetch_translation(
     let run = || -> Result<String, Box<dyn std::error::Error>> {
         let msg = fetch_raw_message(account, folder, uid)?;
         let plain = extract_body(&msg);
-        let src = crate::translate::resolve_source_lang(src_req, &plain);
-        // 源语言即目标语言（如中文邮件译成中文）→ 无需翻译，直接返回原文，
-        // 既省下一次无谓且缓慢的推理，也避免同语种"翻译"产出乱码。
-        if src == tgt {
-            let html = body_to_html(&plain);
-            trans_cache().put(key.clone(), html.clone());
-            return Ok(serde_json::json!({ "ok": true, "body": html }).to_string());
-        }
-        let translated_plain = model_manager()
-            .with_translator(|t| crate::translate::translate_prose(t, &plain, &src, tgt))
-            .map_err(|e| e.to_string())??;
+        // 按引擎翻译正文（返回纯文本；URL/验证码在下面 body_to_html 里重新 linkify）。
+        let translated_plain = match engine {
+            "google" => crate::translate::translate_google(&plain, tgt)?,
+            "deeplx" => crate::translate::translate_deeplx(deeplx_url, &plain, tgt)?,
+            // 默认本地 NLLB（离线）
+            _ => {
+                let src = crate::translate::resolve_source_lang(src_req, &plain);
+                // 源语言==目标语言（如中文邮件译中文）→ 直接返回原文，省下无谓且慢的推理
+                if src == tgt {
+                    let html = body_to_html(&plain);
+                    trans_cache().put(key.clone(), html.clone());
+                    return Ok(serde_json::json!({ "ok": true, "body": html }).to_string());
+                }
+                model_manager()
+                    .with_translator(|t| crate::translate::translate_prose(t, &plain, &src, tgt))
+                    .map_err(|e| e.to_string())??
+            }
+        };
         let html = body_to_html(&translated_plain);
         trans_cache().put(key.clone(), html.clone());
         Ok(serde_json::json!({ "ok": true, "body": html }).to_string())

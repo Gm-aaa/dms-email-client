@@ -19,3 +19,4 @@ regex = "1"
 ct2rs = "0.9"
 whatlang = "0.16"
 hf-hub = "0.3"
+ureq = { version = "2", features = ["json"] }
