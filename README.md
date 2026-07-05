@@ -120,6 +120,36 @@ ln -s /absolute/path/to/dms-email-client/dmsEmailClient ~/.local/share/dms/plugi
 
 ---
 
+## 翻译（离线）
+
+在邮件详情页可一键将正文在「原文 / 翻译」之间切换（仅正文本身，不含主题、发件人或列表摘要）。
+
+### 工作原理
+
+翻译完全在守护进程本地运行：内置 `ct2rs`（已打包 CTranslate2，无需另装系统库）加载 NLLB-200-distilled-600M 模型进行推理。正文不会被发送到任何第三方服务，翻译过程完全离线。
+
+### 首次使用
+
+1. 在设置面板的「翻译设置」中打开「启用翻译」开关后，详情页才会出现「翻译」按钮。
+2. 第一次点击翻译时，会自动联网从 HuggingFace 下载约 600MB 的模型文件到 `~/.local/share/dms-email-client/models/nllb-200-distilled-600M/`（仅首次需要联网，下载完成后之后的翻译完全离线，无需再次联网）。
+3. 首次翻译因需加载模型耗时较长（数秒），之后同一封邮件的翻译结果会在内存中缓存，重复翻译几乎瞬时返回。
+
+### 设置项
+
+- **启用翻译**：开关，默认关闭。
+- **源语言**：默认「自动检测」，也可手动指定邮件原文语言（英语 / 俄语 / 日语 / 韩语 / 法语 / 德语 / 西班牙语等）。
+- **目标语言**：默认「简体中文」，可选英语、日语等。
+
+### 内存占用说明
+
+模型仅在实际发起翻译时按需加载；空闲 5 分钟后会自动从内存中卸载并释放资源，因此不使用翻译功能时守护进程依旧保持原有的低内存占用。
+
+### 从源码编译的额外要求
+
+普通用户使用预编译二进制运行本插件**无需安装任何额外的系统库**。但如果你选择从源码自行编译，由于 `ct2rs` 会在构建时编译内置的 CTranslate2，需要额外安装 **C++ 编译工具链**（如 `gcc`/`g++`）和 **`cmake`**；由于要从源码构建 CTranslate2，编译耗时会明显更长（尤其是首次全新构建）。
+
+---
+
 ## 命令行与 IPC 协议
 
 `dms-email-client` 既是后台守护进程，也是前端与守护进程交互的 CLI 工具。它支持以下命令行参数：
@@ -135,6 +165,10 @@ ln -s /absolute/path/to/dms-email-client/dmsEmailClient ~/.local/share/dms/plugi
 - **获取单封邮件正文**：
   ```bash
   dms-email-client body <account> <folder> <uid>
+  ```
+- **翻译单封邮件正文**（`src`/`tgt` 为 NLLB 语言代码，`src` 传 `auto` 表示自动检测源语言）：
+  ```bash
+  dms-email-client translate <account> <folder> <uid> <src> <tgt>
   ```
 - **标记单封邮件为已读**：
   ```bash
@@ -157,6 +191,7 @@ ln -s /absolute/path/to/dms-email-client/dmsEmailClient ~/.local/share/dms/plugi
 向 socket（`$XDG_RUNTIME_DIR/dms-email-client.sock`）发送以 `\t` 分隔的纯文本指令，以 `\n` 结尾：
 - `status` -> 返回全局状态 JSON（含已读/未读邮件，每封带 `seen` 字段）。
 - `body\t<account>\t<folder>\t<uid>` -> 返回指定邮件的正文 JSON（正文为可渲染 HTML），并写入本地磁盘缓存。
+- `translate\t<account>\t<folder>\t<uid>\t<src>\t<tgt>` -> 返回该邮件正文的翻译结果 JSON（`src` 为 `auto` 时自动检测源语言），翻译结果仅缓存于内存（守护进程重启后失效），不写入磁盘缓存。
 - `read\t<account>\t<folder>\t<uid>` -> 标记为已读，将该邮件的 `seen` 置为 true（仍保留在列表中），返回 `{"ok":true}`。
 - `read_all\t<account>` -> 标记该账户（account 为空则所有账户）当前全部未读为已读，返回 `{"ok":true,"marked":N}`。
 - `reload` / `shutdown` -> 关闭守护进程。
