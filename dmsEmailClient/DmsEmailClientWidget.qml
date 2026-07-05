@@ -193,6 +193,13 @@ PluginComponent {
         running: false
         stdout: StdioCollector {
             onStreamFinished: {
+                // 丢弃用户已切走的那封邮件的迟到响应，避免把 A 的译文贴到 B 上
+                if (!root.selectedMail
+                    || translateProcess.aAccount !== root.selectedMail.account
+                    || translateProcess.aFolder !== (root.selectedMail.folder || "INBOX")
+                    || translateProcess.aUid !== String(root.selectedMail.uid)) {
+                    return;
+                }
                 root.translating = false;
                 try {
                     let d = JSON.parse(this.text);
