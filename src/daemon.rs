@@ -267,6 +267,11 @@ fn handle_client(
                 fetch_translation(accounts, account, folder, uid, src, tgt, engine, deeplx_url);
             let _ = stream.write_all(resp.as_bytes());
         }
+        // 兼容旧前端（未带引擎/URL 参数）：默认本地 nllb
+        ["translate", account, folder, uid, src, tgt] => {
+            let resp = fetch_translation(accounts, account, folder, uid, src, tgt, "nllb", "");
+            let _ = stream.write_all(resp.as_bytes());
+        }
         ["read", account, folder, uid] => {
             let resp = mark_read(accounts, state, account, folder, uid);
             let _ = stream.write_all(resp.as_bytes());

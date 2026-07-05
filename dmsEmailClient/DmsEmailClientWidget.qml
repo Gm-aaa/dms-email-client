@@ -908,14 +908,19 @@ PluginComponent {
                     width: tLabel.implicitWidth + Theme.spacingM * 2
                     height: Theme.iconSize * 1.4
                     radius: Theme.cornerRadius
-                    color: tArea.containsMouse ? Theme.surfaceContainerHighest : Theme.surfaceContainer
+                    // 译文态：填充主色更醒目；原文态：淡容器底、悬停提亮
+                    color: root.showTranslated
+                           ? Theme.primary
+                           : (tArea.containsMouse ? Theme.surfaceContainerHighest : Theme.surfaceContainer)
                     StyledText {
                         id: tLabel
                         anchors.centerIn: parent
-                        text: root.translating ? "翻译中…（首次需下载模型，请稍候）"
+                        text: root.translating
+                              ? (root.translateEngine === "nllb" ? "翻译中…（本地模型，首次较慢）" : "翻译中…")
                               : (root.showTranslated ? "原文" : "翻译")
                         font.pixelSize: Theme.fontSizeSmall
-                        color: Theme.surfaceText
+                        // 原文态用主色文字让按钮更突出；译文态在填充底上用 onPrimary
+                        color: root.showTranslated ? Theme.onPrimary : Theme.primary
                     }
                     MouseArea {
                         id: tArea
