@@ -72,6 +72,41 @@ impl Translator for NllbLocal {
     }
 }
 
+/// NLLB-200-distilled-600M 对单次输入长度有硬上限；超长的整段散文一次性送进
+/// t.translate() 会被模型静默截断（只翻出前一部分）。实测约 741 字符的一段
+/// 完全没问题，所以这里保守起见只在明显超长时才分批：按行边界切分并贪心
+/// 合并相邻行到批次（每批字符数 <= MAX_TRANSLATE_CHARS），逐批翻译后用 '\n'
+/// 拼回——单行本身超过阈值时不再往下拆（罕见边界情况，宁可不拆也不能丢内容）。
+const MAX_TRANSLATE_CHARS: usize = 1200;
+
+fn translate_chunked(t: &dyn Translator, text: &str, src: &str, tgt: &str) -> Result<String, String> {
+    if text.chars().count() <= MAX_TRANSLATE_CHARS {
+        return t.translate(text, src, tgt);
+    }
+
+    let mut batches: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for line in text.split('\n') {
+        let extra = if cur.is_empty() { line.chars().count() } else { line.chars().count() + 1 };
+        if !cur.is_empty() && cur.chars().count() + extra > MAX_TRANSLATE_CHARS {
+            batches.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push('\n');
+        }
+        cur.push_str(line);
+    }
+    if !cur.is_empty() {
+        batches.push(cur);
+    }
+
+    let mut translated_batches = Vec::with_capacity(batches.len());
+    for batch in batches {
+        translated_batches.push(t.translate(&batch, src, tgt)?);
+    }
+    Ok(translated_batches.join("\n"))
+}
+
 /// 翻译一段散文文本，同时把其中 4–8 位的独立数字串（验证码）挖出来保持原样，
 /// 不送进 translate()——与 daemon.rs 里 process_text_segment 用的是同一条
 /// `[0-9]+` 正则 + 4..=8 长度判断，两处规则必须一致。
@@ -90,16 +125,20 @@ fn translate_text_preserving_codes(
         let len = m.end() - m.start();
         if (4..=8).contains(&len) {
             let chunk = &text[last..m.start()];
-            if !chunk.is_empty() {
-                out.push_str(&t.translate(chunk, src, tgt)?);
+            if !chunk.trim().is_empty() {
+                out.push_str(&translate_chunked(t, chunk, src, tgt)?);
+            } else {
+                out.push_str(chunk); // 纯空白间隔：原样保留，不送翻译器（否则可能把两个相邻验证码拼到一起）
             }
             out.push_str(m.as_str()); // 验证码原样保留，不送翻译器
             last = m.end();
         }
     }
     let tail = &text[last..];
-    if !tail.is_empty() {
-        out.push_str(&t.translate(tail, src, tgt)?);
+    if !tail.trim().is_empty() {
+        out.push_str(&translate_chunked(t, tail, src, tgt)?);
+    } else {
+        out.push_str(tail);
     }
     Ok(out)
 }
@@ -377,6 +416,78 @@ mod tests {
         let plain = "Your code 482913 expires soon.";
         let out = translate_prose(&DigitMangler, plain, "eng_Latn", "zho_Hans").unwrap();
         assert!(out.contains("482913"), "4-8 digit code was sent to translator and mangled: {out}");
+    }
+
+    /// Wraps DigitMangler but records whether translate() was ever called with a
+    /// whitespace-only chunk. DigitMangler itself is content-preserving on non-digit
+    /// text (identity on whitespace), so a plain output-content assertion can't tell
+    /// apart "translated then returned unchanged" from "never sent, pushed verbatim"
+    /// — this tracker makes the routing bug (fix #1) observable in a unit test, the
+    /// same way a real lossy translator could merge/garble that gap in production.
+    struct DigitManglerTrackWhitespaceCalls {
+        whitespace_calls: std::cell::Cell<u32>,
+    }
+    impl Translator for DigitManglerTrackWhitespaceCalls {
+        fn translate(&self, text: &str, src: &str, tgt: &str) -> Result<String, String> {
+            if text.trim().is_empty() {
+                self.whitespace_calls.set(self.whitespace_calls.get() + 1);
+            }
+            DigitMangler.translate(text, src, tgt)
+        }
+    }
+
+    /// Fix #1: whitespace-only gap between two adjacent 4-8 digit codes must NOT be
+    /// sent to the (possibly lossy) translator — otherwise a mangling/empty-returning
+    /// translator can merge the two codes together (e.g. "482913123456") or inject a
+    /// stray glyph in the separator. The gap must be preserved verbatim.
+    #[test]
+    fn two_adjacent_codes_stay_separated() {
+        let plain = "Codes 482913 123456 end.";
+        let tracker = DigitManglerTrackWhitespaceCalls { whitespace_calls: std::cell::Cell::new(0) };
+        let out = translate_prose(&tracker, plain, "eng_Latn", "zho_Hans").unwrap();
+        assert!(out.contains("482913"), "first code mangled/lost: {out}");
+        assert!(out.contains("123456"), "second code mangled/lost: {out}");
+        assert!(
+            out.contains("482913 123456"),
+            "codes got merged or separator corrupted: {out}"
+        );
+        assert_eq!(
+            tracker.whitespace_calls.get(),
+            0,
+            "whitespace-only inter-code gap must not be routed through translate()"
+        );
+    }
+
+    /// Fix #2: NLLB has a bounded input length; a very long prose block sent as one
+    /// translate() call would get silently truncated by the model. translate_chunked
+    /// must split long text on line boundaries into batches and rejoin them, so both
+    /// the first and last line survive translation intact.
+    #[test]
+    fn long_prose_is_fully_translated_not_truncated() {
+        let mut long = String::new();
+        for i in 1..=60 {
+            long.push_str(&format!("Line {i}: some sentence about email translation testing.\n"));
+        }
+        assert!(
+            long.chars().count() > MAX_TRANSLATE_CHARS,
+            "test fixture not long enough: {} chars",
+            long.chars().count()
+        );
+
+        let out = translate_chunked(&MockTranslator, &long, "eng_Latn", "zho_Hans").unwrap();
+        assert!(out.contains("Line 1:"), "first line missing from output (truncated?): {out}");
+        assert!(out.contains("Line 60:"), "last line missing from output (truncated?): {out}");
+        assert!(out.contains("<译>"), "content not routed through translator: {out}");
+
+        // Short text stays a single batch: exactly one translate() call, whole text
+        // wrapped once (not split per line).
+        let short = "Hello, this is a short sentence.";
+        let short_out = translate_chunked(&MockTranslator, short, "eng_Latn", "zho_Hans").unwrap();
+        assert_eq!(
+            short_out,
+            format!("<译>{short}</译>"),
+            "short text should go through as a single translate call: {short_out}"
+        );
     }
 
     #[test]
