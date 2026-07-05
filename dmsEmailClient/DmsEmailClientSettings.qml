@@ -224,6 +224,51 @@ PluginSettings {
         }
     }
 
+    // ── Translation Section ──
+    StyledText {
+        width: parent.width
+        text: "翻译设置"
+        font.pixelSize: Theme.fontSizeMedium
+        font.weight: Font.Bold
+        color: Theme.surfaceText
+        topPadding: Theme.spacingM
+    }
+
+    ToggleSetting {
+        settingKey: "translateEnabled"
+        label: "启用翻译"
+        description: "在邮件详情页显示翻译按钮。首次翻译需联网下载约 600MB 离线模型（存于 ~/.local/share/dms-email-client/models），之后完全离线。"
+        defaultValue: false
+    }
+
+    SelectionSetting {
+        settingKey: "translateSourceLang"
+        label: "源语言"
+        description: "邮件原文语言，通常保持自动检测即可。"
+        options: [
+            { label: "自动检测", value: "auto" },
+            { label: "英语", value: "eng_Latn" },
+            { label: "俄语", value: "rus_Cyrl" },
+            { label: "日语", value: "jpn_Jpan" },
+            { label: "韩语", value: "kor_Hang" },
+            { label: "法语", value: "fra_Latn" },
+            { label: "德语", value: "deu_Latn" },
+            { label: "西班牙语", value: "spa_Latn" }
+        ]
+        defaultValue: "auto"
+    }
+
+    SelectionSetting {
+        settingKey: "translateTargetLang"
+        label: "目标语言"
+        options: [
+            { label: "简体中文", value: "zho_Hans" },
+            { label: "英语", value: "eng_Latn" },
+            { label: "日语", value: "jpn_Jpan" }
+        ]
+        defaultValue: "zho_Hans"
+    }
+
     // ── Account Management Section ──
     StyledText {
         width: parent.width
