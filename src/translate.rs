@@ -35,40 +35,66 @@ impl NllbLocal {
         // "</s> <src_lang>" 后缀，见上方模块说明。
         tokenizer.disable_spacial_token();
 
+        // 线程数交给 CTranslate2 按硬件核数自动选择（num_threads_per_replica=0，
+        // 即 Config::default()）——这本身就是"按 CPU 核数动态分配"，且比强行写满逻辑
+        // 核数更稳(避免超线程过度订阅拖慢小批量推理)。
         let translator = Ct2Translator::with_tokenizer(model_dir, tokenizer, &Config::default())
             .map_err(|e| format!("加载 NLLB 模型失败: {e}"))?;
         Ok(NllbLocal { translator })
     }
 
-    /// 翻译一段文本。src/tgt 为 NLLB(FLORES-200) 语言码，如 eng_Latn / zho_Hans。
-    /// NLLB 约定：源句末尾追加 "</s> 源语言token"，target_prefix 为目标语言 token。
-    pub fn translate_one(&self, text: &str, src: &str, tgt: &str) -> Result<String, String> {
-        // 手动构造 NLLB 期望的源序列: "<text> </s> <src_lang>"
-        let source = format!("{text} </s> {src}");
-        let target_prefixes = vec![vec![tgt.to_string()]];
-
+    /// 批量翻译多段文本：**一次**模型调用，CTranslate2 内部并行处理整批——比逐段
+    /// 单独调用快得多。src/tgt 为 NLLB(FLORES-200) 语言码。NLLB 约定：源句末尾追加
+    /// "</s> 源语言token"，target_prefix 为目标语言 token。
+    pub fn translate_many(&self, texts: &[String], src: &str, tgt: &str) -> Result<Vec<String>, String> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sources: Vec<String> = texts.iter().map(|t| format!("{t} </s> {src}")).collect();
+        let target_prefixes: Vec<Vec<String>> = vec![vec![tgt.to_string()]; texts.len()];
         let results = self
             .translator
-            .translate_batch_with_target_prefix(
-                &[source],
-                &target_prefixes,
-                &TranslationOptions::default(),
-                None,
-            )
+            .translate_batch_with_target_prefix(&sources, &target_prefixes, &translate_options(), None)
             .map_err(|e| format!("翻译失败: {e}"))?;
+        Ok(results.into_iter().map(|(text, _score)| text).collect())
+    }
 
-        Ok(results.into_iter().next().map(|(text, _score)| text).unwrap_or_default())
+    /// 翻译单段文本（便捷封装，内部走 translate_many）。
+    pub fn translate_one(&self, text: &str, src: &str, tgt: &str) -> Result<String, String> {
+        Ok(self
+            .translate_many(std::slice::from_ref(&text.to_string()), src, tgt)?
+            .into_iter()
+            .next()
+            .unwrap_or_default())
+    }
+}
+
+/// NLLB 解码选项：保留默认 beam_size=2（实测 beam=1 在 CPU 上无明显提速，故不牺牲
+/// 质量）；max_decoding_length 从默认 256 提到 512，避免较长片段的输出被静默截断。
+fn translate_options() -> TranslationOptions<String, String> {
+    TranslationOptions {
+        max_decoding_length: 512,
+        ..Default::default()
     }
 }
 
 /// 翻译后端抽象（薄）。仅为可测试性与接缝，本期只有 NllbLocal 一个实现。
 pub trait Translator {
     fn translate(&self, text: &str, src: &str, tgt: &str) -> Result<String, String>;
+
+    /// 批量翻译。默认逐条调用 `translate`（够测试用）；NllbLocal 覆盖为一次真正的
+    /// 批推理，这是加速的关键——调用方应尽量把多段收集成一批传进来。
+    fn translate_batch(&self, texts: &[String], src: &str, tgt: &str) -> Result<Vec<String>, String> {
+        texts.iter().map(|t| self.translate(t, src, tgt)).collect()
+    }
 }
 
 impl Translator for NllbLocal {
     fn translate(&self, text: &str, src: &str, tgt: &str) -> Result<String, String> {
         self.translate_one(text, src, tgt)
+    }
+    fn translate_batch(&self, texts: &[String], src: &str, tgt: &str) -> Result<Vec<String>, String> {
+        self.translate_many(texts, src, tgt)
     }
 }
 
@@ -79,17 +105,43 @@ impl Translator for NllbLocal {
 /// 拼回——单行本身超过阈值时不再往下拆（罕见边界情况，宁可不拆也不能丢内容）。
 const MAX_TRANSLATE_CHARS: usize = 1200;
 
-fn translate_chunked(t: &dyn Translator, text: &str, src: &str, tgt: &str) -> Result<String, String> {
-    if text.chars().count() <= MAX_TRANSLATE_CHARS {
-        return t.translate(text, src, tgt);
-    }
+/// 正文切段后的有序片段：`Verbatim` 原样保留(URL / 验证码 / 空白 / 批次间换行)，
+/// `Slot(i)` 表示第 i 个待译片段——所有 Slot 的文本会被收集成**一批**一次性翻译。
+enum Seg {
+    Verbatim(String),
+    Slot(usize),
+}
 
-    let mut batches: Vec<String> = Vec::new();
+/// 把一段散文加入待译集合：纯空白原样保留；短段作为一个 Slot；超长段按行边界
+/// 贪心切成 <= MAX_TRANSLATE_CHARS 的多个 Slot（批次间以换行原样连接），避免模型
+/// 对超长输入静默截断。
+fn push_translatable(text: &str, chunks: &mut Vec<String>, layout: &mut Vec<Seg>) {
+    if text.trim().is_empty() {
+        if !text.is_empty() {
+            layout.push(Seg::Verbatim(text.to_string()));
+        }
+        return;
+    }
+    if text.chars().count() <= MAX_TRANSLATE_CHARS {
+        layout.push(Seg::Slot(chunks.len()));
+        chunks.push(text.to_string());
+        return;
+    }
+    // 超长：按行贪心分批，批次之间用 '\n' 原样连接
     let mut cur = String::new();
+    let mut emitted_batch = false;
+    let flush = |cur: &mut String, chunks: &mut Vec<String>, layout: &mut Vec<Seg>, emitted: &mut bool| {
+        if *emitted {
+            layout.push(Seg::Verbatim("\n".to_string()));
+        }
+        layout.push(Seg::Slot(chunks.len()));
+        chunks.push(std::mem::take(cur));
+        *emitted = true;
+    };
     for line in text.split('\n') {
         let extra = if cur.is_empty() { line.chars().count() } else { line.chars().count() + 1 };
         if !cur.is_empty() && cur.chars().count() + extra > MAX_TRANSLATE_CHARS {
-            batches.push(std::mem::take(&mut cur));
+            flush(&mut cur, chunks, layout, &mut emitted_batch);
         }
         if !cur.is_empty() {
             cur.push('\n');
@@ -97,56 +149,33 @@ fn translate_chunked(t: &dyn Translator, text: &str, src: &str, tgt: &str) -> Re
         cur.push_str(line);
     }
     if !cur.is_empty() {
-        batches.push(cur);
+        flush(&mut cur, chunks, layout, &mut emitted_batch);
     }
-
-    let mut translated_batches = Vec::with_capacity(batches.len());
-    for batch in batches {
-        translated_batches.push(t.translate(&batch, src, tgt)?);
-    }
-    Ok(translated_batches.join("\n"))
 }
 
-/// 翻译一段散文文本，同时把其中 4–8 位的独立数字串（验证码）挖出来保持原样，
-/// 不送进 translate()——与 daemon.rs 里 process_text_segment 用的是同一条
-/// `[0-9]+` 正则 + 4..=8 长度判断，两处规则必须一致。
-fn translate_text_preserving_codes(
-    t: &dyn Translator,
-    text: &str,
-    src: &str,
-    tgt: &str,
-) -> Result<String, String> {
+/// 把一段普通文本(不含 URL)切成片段：挖出 4–8 位独立数字串(验证码)原样保留，其余
+/// 散文交给 push_translatable。与 daemon.rs 里 process_text_segment 同一条 `[0-9]+`
+/// 正则 + 4..=8 长度判断，两处规则必须一致。
+fn push_prose(text: &str, chunks: &mut Vec<String>, layout: &mut Vec<Seg>) {
     static DIGIT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let digit_re = DIGIT_RE.get_or_init(|| regex::Regex::new(r"[0-9]+").unwrap());
 
-    let mut out = String::new();
     let mut last = 0;
     for m in digit_re.find_iter(text) {
         let len = m.end() - m.start();
         if (4..=8).contains(&len) {
-            let chunk = &text[last..m.start()];
-            if !chunk.trim().is_empty() {
-                out.push_str(&translate_chunked(t, chunk, src, tgt)?);
-            } else {
-                out.push_str(chunk); // 纯空白间隔：原样保留，不送翻译器（否则可能把两个相邻验证码拼到一起）
-            }
-            out.push_str(m.as_str()); // 验证码原样保留，不送翻译器
+            push_translatable(&text[last..m.start()], chunks, layout);
+            layout.push(Seg::Verbatim(m.as_str().to_string())); // 验证码原样保留
             last = m.end();
         }
     }
-    let tail = &text[last..];
-    if !tail.trim().is_empty() {
-        out.push_str(&translate_chunked(t, tail, src, tgt)?);
-    } else {
-        out.push_str(tail);
-    }
-    Ok(out)
+    push_translatable(&text[last..], chunks, layout);
 }
 
-/// 把纯文本正文翻译成目标语言：用 URL 正则把文本切成【散文段 | URL 段】，只翻散文，
-/// URL 原样保留；每个散文段内部再由 translate_text_preserving_codes 挖出 4–8 位
-/// 验证码保持原样——不再依赖"模型碰巧不改数字"的假设，而是代码层面强制隔离。
-/// 返回**纯文本**，由调用方 body_to_html。
+/// 把纯文本正文翻译成目标语言：先切成【URL 原样 | 散文(验证码原样) | 空白原样】的
+/// 有序片段，把**所有**待译散文收集成一批、**一次**模型调用翻译（大幅提速，
+/// CTranslate2 内部并行整批），再按序回填。URL 与 4–8 位验证码始终原样保留（代码层
+/// 面隔离，不依赖模型行为）。返回**纯文本**，由调用方 body_to_html。
 pub fn translate_prose(
     t: &dyn Translator,
     plain: &str,
@@ -157,23 +186,29 @@ pub fn translate_prose(
     let url_re =
         URL_RE.get_or_init(|| regex::Regex::new(r#"<?(https?://[^\s<>"']+)>?"#).unwrap());
 
-    let mut out = String::new();
+    let mut chunks: Vec<String> = Vec::new();
+    let mut layout: Vec<Seg> = Vec::new();
     let mut last = 0;
     for m in url_re.find_iter(plain) {
-        let prose = &plain[last..m.start()];
-        if !prose.trim().is_empty() {
-            out.push_str(&translate_text_preserving_codes(t, prose, src, tgt)?);
-        } else {
-            out.push_str(prose);
-        }
-        out.push_str(m.as_str()); // URL 原样
+        push_prose(&plain[last..m.start()], &mut chunks, &mut layout);
+        layout.push(Seg::Verbatim(m.as_str().to_string())); // URL 原样保留
         last = m.end();
     }
-    let tail = &plain[last..];
-    if !tail.trim().is_empty() {
-        out.push_str(&translate_text_preserving_codes(t, tail, src, tgt)?);
+    push_prose(&plain[last..], &mut chunks, &mut layout);
+
+    // 关键：所有散文片段一次性批量翻译
+    let translated = if chunks.is_empty() {
+        Vec::new()
     } else {
-        out.push_str(tail);
+        t.translate_batch(&chunks, src, tgt)?
+    };
+
+    let mut out = String::new();
+    for seg in layout {
+        match seg {
+            Seg::Verbatim(s) => out.push_str(&s),
+            Seg::Slot(i) => out.push_str(translated.get(i).map(|s| s.as_str()).unwrap_or("")),
+        }
     }
     Ok(out)
 }
@@ -459,7 +494,7 @@ mod tests {
     }
 
     /// Fix #2: NLLB has a bounded input length; a very long prose block sent as one
-    /// translate() call would get silently truncated by the model. translate_chunked
+    /// translate() call would get silently truncated by the model. translate_prose
     /// must split long text on line boundaries into batches and rejoin them, so both
     /// the first and last line survive translation intact.
     #[test]
@@ -474,19 +509,46 @@ mod tests {
             long.chars().count()
         );
 
-        let out = translate_chunked(&MockTranslator, &long, "eng_Latn", "zho_Hans").unwrap();
+        let out = translate_prose(&MockTranslator, &long, "eng_Latn", "zho_Hans").unwrap();
         assert!(out.contains("Line 1:"), "first line missing from output (truncated?): {out}");
         assert!(out.contains("Line 60:"), "last line missing from output (truncated?): {out}");
         assert!(out.contains("<译>"), "content not routed through translator: {out}");
 
-        // Short text stays a single batch: exactly one translate() call, whole text
-        // wrapped once (not split per line).
+        // 短文本作为单个片段整段翻译一次（不按行拆）。
         let short = "Hello, this is a short sentence.";
-        let short_out = translate_chunked(&MockTranslator, short, "eng_Latn", "zho_Hans").unwrap();
+        let short_out = translate_prose(&MockTranslator, short, "eng_Latn", "zho_Hans").unwrap();
         assert_eq!(
             short_out,
             format!("<译>{short}</译>"),
             "short text should go through as a single translate call: {short_out}"
+        );
+    }
+
+    /// 记录 translate_batch 被调用的次数，用来证明整封邮件的所有散文片段是
+    /// **一次**批量翻译（性能关键），而不是逐段多次调用。
+    struct BatchCallCounter {
+        batch_calls: std::cell::Cell<u32>,
+    }
+    impl Translator for BatchCallCounter {
+        fn translate(&self, text: &str, _src: &str, _tgt: &str) -> Result<String, String> {
+            Ok(text.to_string())
+        }
+        fn translate_batch(&self, texts: &[String], _src: &str, _tgt: &str) -> Result<Vec<String>, String> {
+            self.batch_calls.set(self.batch_calls.get() + 1);
+            Ok(texts.to_vec())
+        }
+    }
+
+    #[test]
+    fn all_prose_segments_translated_in_one_batch() {
+        // 多段散文（被 URL 和验证码打断成 3 段可译文本）
+        let plain = "First part https://a.com/x second part 482913 third part here.";
+        let counter = BatchCallCounter { batch_calls: std::cell::Cell::new(0) };
+        let _ = translate_prose(&counter, plain, "eng_Latn", "zho_Hans").unwrap();
+        assert_eq!(
+            counter.batch_calls.get(),
+            1,
+            "所有散文片段必须在一次 translate_batch 调用里翻完"
         );
     }
 

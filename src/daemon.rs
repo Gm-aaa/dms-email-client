@@ -468,25 +468,35 @@ fn fetch_translation(
         Some(a) => a,
         None => return json_err("账户不存在"),
     };
+    // 缓存键用**请求值** src_req（如字面量 "auto"），这样命中检查可以在联网取信
+    // **之前**完成 —— 同一封邮件、同样的 src_req/tgt，译文缓存命中即直接返回，省掉
+    // 每次约 2s 的 IMAP 原文重取。
+    let key: crate::translate::TransKey = (
+        account_name.to_string(),
+        folder.to_string(),
+        uid.parse::<u32>().unwrap_or(0),
+        src_req.to_string(),
+        tgt.to_string(),
+    );
+    if let Some(html) = trans_cache().get(&key) {
+        return serde_json::json!({ "ok": true, "body": html }).to_string();
+    }
     let run = || -> Result<String, Box<dyn std::error::Error>> {
         let msg = fetch_raw_message(account, folder, uid)?;
         let plain = extract_body(&msg);
         let src = crate::translate::resolve_source_lang(src_req, &plain);
-        let key: crate::translate::TransKey = (
-            account_name.to_string(),
-            folder.to_string(),
-            uid.parse::<u32>().unwrap_or(0),
-            src.clone(),
-            tgt.to_string(),
-        );
-        if let Some(html) = trans_cache().get(&key) {
+        // 源语言即目标语言（如中文邮件译成中文）→ 无需翻译，直接返回原文，
+        // 既省下一次无谓且缓慢的推理，也避免同语种"翻译"产出乱码。
+        if src == tgt {
+            let html = body_to_html(&plain);
+            trans_cache().put(key.clone(), html.clone());
             return Ok(serde_json::json!({ "ok": true, "body": html }).to_string());
         }
         let translated_plain = model_manager()
             .with_translator(|t| crate::translate::translate_prose(t, &plain, &src, tgt))
             .map_err(|e| e.to_string())??;
         let html = body_to_html(&translated_plain);
-        trans_cache().put(key, html.clone());
+        trans_cache().put(key.clone(), html.clone());
         Ok(serde_json::json!({ "ok": true, "body": html }).to_string())
     };
     run().unwrap_or_else(|e| json_err(&e.to_string()))
