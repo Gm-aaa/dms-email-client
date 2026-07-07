@@ -185,8 +185,16 @@ fn handle_watch(mut stream: UnixStream, state: &Arc<RwLock<DaemonState>>) {
 }
 
 /// 尝试连接现有 socket 并请求状态；若得到有效响应说明已有守护进程在运行。
+///
+/// 探测带读/写超时：若 socket 上有个**卡死**的旧进程在监听但不应答（或正处于
+/// remove_file→exit 的关停窗口），无超时的 `read_to_string` 会永久阻塞，导致新实例
+/// 卡在启动、永不 bind。健康守护进程毫秒级即应答，故 3 秒超时不会误伤正常实例；
+/// 一旦超时则视为“没有健康实例在跑”，继续往下接管 socket（对卡死进程正是所需的恢复）。
 fn already_running() -> bool {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
     if let Ok(mut s) = UnixStream::connect(socket_path()) {
+        let _ = s.set_read_timeout(Some(PROBE_TIMEOUT));
+        let _ = s.set_write_timeout(Some(PROBE_TIMEOUT));
         let _ = s.write_all(b"status\n");
         let _ = s.flush();
         let mut buf = String::new();

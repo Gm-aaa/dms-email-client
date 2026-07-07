@@ -183,6 +183,13 @@ pub fn fetch_translation(
     let run = || -> Result<String, Box<dyn std::error::Error>> {
         let msg = fetch_raw_message(account, folder, uid, io_timeout)?;
         let plain = extract_body(&msg);
+        // 前置判断：正文为空/纯空白时无需翻译，直接返回。否则本地 NLLB 引擎会为“空”
+        // 触发首次约 600MB 的模型下载、在线引擎会发无谓请求。
+        if plain.trim().is_empty() {
+            let html = body_to_html(&plain);
+            trans_cache().put(key.clone(), html.clone());
+            return Ok(serde_json::json!({ "ok": true, "body": html }).to_string());
+        }
         // 按引擎翻译正文（返回纯文本；URL/验证码在下面 body_to_html 里重新 linkify）。
         let translated_plain = match engine {
             "google" => translate::translate_google(&plain, tgt)?,
