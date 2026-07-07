@@ -32,11 +32,28 @@ pub struct Config {
     /// 邮件正文磁盘缓存目录
     #[serde(default = "default_cache_dir")]
     pub cache_dir: String,
+    /// IMAP 读/写超时（秒）。稳态 fetch（取头部/正文/标记已读）超过此值即报错重连，
+    /// 避免半死的 TCP（NAT/代理静默丢连）把账户线程或取信请求永久卡住。
+    /// 不影响 IDLE 的长等待（IDLE 有独立的 5 分钟超时）。最小 5 秒。
+    #[serde(default = "default_imap_timeout_secs")]
+    pub imap_timeout_secs: u64,
+    /// 正文磁盘缓存的最多文件数（0 表示不限制）。超过后按修改时间淘汰最旧的，
+    /// 防止缓存目录无上限增长。
+    #[serde(default = "default_body_cache_limit")]
+    pub body_cache_limit: usize,
     pub accounts: Vec<Account>,
 }
 
 fn default_cache_limit() -> usize {
     50
+}
+
+fn default_imap_timeout_secs() -> u64 {
+    60
+}
+
+fn default_body_cache_limit() -> usize {
+    500
 }
 
 pub fn default_cache_dir() -> String {
@@ -65,6 +82,8 @@ impl Config {
             let default_config = Config {
                 cache_limit: default_cache_limit(),
                 cache_dir: default_cache_dir(),
+                imap_timeout_secs: default_imap_timeout_secs(),
+                body_cache_limit: default_body_cache_limit(),
                 accounts: vec![Account {
                     name: "Example QQ".to_string(),
                     host: "imap.qq.com".to_string(),

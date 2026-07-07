@@ -1,11 +1,15 @@
 mod config;
 mod daemon;
+mod ipc;
+mod mailhtml;
+mod segment;
+mod sysmem;
 mod translate;
 
 use clap::{Parser, Subcommand};
 use config::Config;
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use ipc::Request;
+use std::io::Read;
 
 #[derive(Parser)]
 #[command(name = "dms-email-client")]
@@ -95,25 +99,23 @@ fn main() {
             }
         }
         Some(Commands::Watch) => {
-            stream_command("watch");
+            ipc::stream(&Request::Watch);
         }
         Some(Commands::Status) | None => {
             // Default to query status
-            send_command("status");
+            ipc::send(&Request::Status);
         }
         Some(Commands::Body { account, folder, uid }) => {
-            send_command(&format!("body\t{}\t{}\t{}", account, folder, uid));
+            ipc::send(&Request::Body { account, folder, uid });
         }
         Some(Commands::Read { account, folder, uid }) => {
-            send_command(&format!("read\t{}\t{}\t{}", account, folder, uid));
+            ipc::send(&Request::Read { account, folder, uid });
         }
         Some(Commands::ReadAll { account }) => {
-            send_command(&format!("read_all\t{}", account));
+            ipc::send(&Request::ReadAll { account });
         }
         Some(Commands::Translate { account, folder, uid, src, tgt, engine, deeplx_url }) => {
-            send_command(&format!(
-                "translate\t{account}\t{folder}\t{uid}\t{src}\t{tgt}\t{engine}\t{deeplx_url}"
-            ));
+            ipc::send(&Request::Translate { account, folder, uid, src, tgt, engine, deeplx_url });
         }
         Some(Commands::Config { action }) => {
             match action {
@@ -155,65 +157,4 @@ fn main() {
             }
         }
     }
-}
-
-/// 连接守护进程 socket，发送一行命令并打印其响应
-fn send_command(cmd: &str) {
-    match UnixStream::connect(daemon::socket_path()) {
-        Ok(mut stream) => {
-            let _ = stream.write_all(cmd.as_bytes());
-            let _ = stream.write_all(b"\n");
-            let _ = stream.flush();
-            let mut response = String::new();
-            if let Err(e) = stream.read_to_string(&mut response) {
-                print_error_json(&format!("Read error: {}", e));
-                return;
-            }
-            // Directly output the JSON received from daemon
-            println!("{}", response);
-        }
-        Err(_) => {
-            print_error_json("Daemon not running");
-        }
-    }
-}
-
-/// 连接守护进程 socket，发送订阅命令，然后把服务端持续推送的每一行**流式**转发到
-/// stdout（逐块读取并 flush，不等 EOF）。守护进程关闭连接或出错时返回，进程随之退出，
-/// 前端据此重连。前端用 SplitParser 逐行消费，实现零延迟的状态更新。
-fn stream_command(cmd: &str) {
-    match UnixStream::connect(daemon::socket_path()) {
-        Ok(mut stream) => {
-            let _ = stream.write_all(cmd.as_bytes());
-            let _ = stream.write_all(b"\n");
-            let _ = stream.flush();
-            let mut buf = [0u8; 4096];
-            let stdout = std::io::stdout();
-            loop {
-                match stream.read(&mut buf) {
-                    Ok(0) => break, // 守护进程关闭了连接
-                    Ok(n) => {
-                        let mut lock = stdout.lock();
-                        if lock.write_all(&buf[..n]).is_err() {
-                            break;
-                        }
-                        let _ = lock.flush();
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-        Err(_) => {
-            print_error_json("Daemon not running");
-        }
-    }
-}
-
-fn print_error_json(err_msg: &str) {
-    let err_json = serde_json::json!({
-        "error": err_msg,
-        "unread_mails": [],
-        "last_update": ""
-    });
-    println!("{}", err_json.to_string());
 }

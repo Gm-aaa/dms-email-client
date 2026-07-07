@@ -153,26 +153,7 @@ fn push_translatable(text: &str, chunks: &mut Vec<String>, layout: &mut Vec<Seg>
     }
 }
 
-/// 把一段普通文本(不含 URL)切成片段：挖出 4–8 位独立数字串(验证码)原样保留，其余
-/// 散文交给 push_translatable。与 daemon.rs 里 process_text_segment 同一条 `[0-9]+`
-/// 正则 + 4..=8 长度判断，两处规则必须一致。
-fn push_prose(text: &str, chunks: &mut Vec<String>, layout: &mut Vec<Seg>) {
-    static DIGIT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let digit_re = DIGIT_RE.get_or_init(|| regex::Regex::new(r"[0-9]+").unwrap());
-
-    let mut last = 0;
-    for m in digit_re.find_iter(text) {
-        let len = m.end() - m.start();
-        if (4..=8).contains(&len) {
-            push_translatable(&text[last..m.start()], chunks, layout);
-            layout.push(Seg::Verbatim(m.as_str().to_string())); // 验证码原样保留
-            last = m.end();
-        }
-    }
-    push_translatable(&text[last..], chunks, layout);
-}
-
-/// 把纯文本正文翻译成目标语言：先切成【URL 原样 | 散文(验证码原样) | 空白原样】的
+/// 把纯文本正文翻译成目标语言：先用 [`crate::segment`] 切成【URL | 验证码 | 散文】的
 /// 有序片段，把**所有**待译散文收集成一批、**一次**模型调用翻译（大幅提速，
 /// CTranslate2 内部并行整批），再按序回填。URL 与 4–8 位验证码始终原样保留（代码层
 /// 面隔离，不依赖模型行为）。返回**纯文本**，由调用方 body_to_html。
@@ -182,19 +163,19 @@ pub fn translate_prose(
     src: &str,
     tgt: &str,
 ) -> Result<String, String> {
-    static URL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let url_re =
-        URL_RE.get_or_init(|| regex::Regex::new(r#"<?(https?://[^\s<>"']+)>?"#).unwrap());
+    use crate::segment::Segment;
 
     let mut chunks: Vec<String> = Vec::new();
     let mut layout: Vec<Seg> = Vec::new();
-    let mut last = 0;
-    for m in url_re.find_iter(plain) {
-        push_prose(&plain[last..m.start()], &mut chunks, &mut layout);
-        layout.push(Seg::Verbatim(m.as_str().to_string())); // URL 原样保留
-        last = m.end();
+    for seg in crate::segment::segment(plain) {
+        match seg {
+            // URL / 验证码原样保留，不送翻译
+            Segment::Url(u) => layout.push(Seg::Verbatim(u.to_string())),
+            Segment::Code(c) => layout.push(Seg::Verbatim(c.to_string())),
+            // 散文：可能进一步按行切成多批（超长时），最终收集成一批一次性翻译
+            Segment::Text(txt) => push_translatable(txt, &mut chunks, &mut layout),
+        }
     }
-    push_prose(&plain[last..], &mut chunks, &mut layout);
 
     // 关键：所有散文片段一次性批量翻译
     let translated = if chunks.is_empty() {
@@ -395,14 +376,22 @@ const MODEL_FILES: [&str; 7] = [
     "tokenizer.json",
 ];
 
+/// 某文件存在且非空（长度 > 0）。用于判断模型文件是否真正落地（防半截下载）。
+fn file_ready(path: &Path) -> bool {
+    std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+}
+
 /// 确保模型就绪：缺失则从 HuggingFace 下载社区预转换好的 CT2 (int8) 版模型 +
 /// 配套分词器文件到 model_dir()，避免运行时依赖 Python 转换脚本。
-/// 若 model.bin 与 tokenizer.json 均已存在，视为已就绪，直接跳过下载。
+///
+/// 就绪判定改为「**全部** MODEL_FILES 都存在且非空」——而非只看 model.bin/tokenizer.json：
+/// 上次若在中途（例如 sentencepiece.bpe.model 还没下完）被打断，粗判会误以为就绪、随后
+/// NllbLocal::load 反复失败。每个文件下载带最多 3 次重试，落盘后校验非空，尽量把
+/// 「网络抖动 / 半截文件」挡在运行前。
 pub fn ensure_model() -> Result<PathBuf, String> {
     let dir = model_dir();
-    let model_bin = dir.join("model.bin");
-    let tokenizer_json = dir.join("tokenizer.json");
-    if model_bin.exists() && tokenizer_json.exists() {
+    // 全部文件齐备且非空 → 直接就绪
+    if MODEL_FILES.iter().all(|f| file_ready(&dir.join(f))) {
         return Ok(dir);
     }
     std::fs::create_dir_all(&dir).map_err(|e| format!("建目录失败: {e}"))?;
@@ -411,8 +400,39 @@ pub fn ensure_model() -> Result<PathBuf, String> {
     let api = hf_hub::api::sync::Api::new().map_err(|e| format!("hf-hub 初始化失败: {e}"))?;
     let r = api.model(repo.to_string());
     for f in MODEL_FILES {
-        let got = r.get(f).map_err(|e| format!("下载 {f} 失败: {e}"))?;
-        std::fs::copy(&got, dir.join(f)).map_err(|e| format!("落盘 {f} 失败: {e}"))?;
+        let dest = dir.join(f);
+        // 已就绪的文件跳过（支持断点续跑：上次下到一半，这次只补没下完的）
+        if file_ready(&dest) {
+            continue;
+        }
+        // 单文件最多尝试 3 次，抵御瞬时网络抖动
+        let mut last_err = String::new();
+        let mut ok = false;
+        for attempt in 1..=3 {
+            match r.get(f).map_err(|e| format!("下载 {f} 失败: {e}")).and_then(|got| {
+                std::fs::copy(&got, &dest).map_err(|e| format!("落盘 {f} 失败: {e}"))?;
+                if file_ready(&dest) {
+                    Ok(())
+                } else {
+                    Err(format!("{f} 落盘后为空文件"))
+                }
+            }) {
+                Ok(()) => {
+                    ok = true;
+                    break;
+                }
+                Err(e) => {
+                    last_err = e;
+                    let _ = std::fs::remove_file(&dest); // 清掉半截文件再重试
+                    if attempt < 3 {
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                }
+            }
+        }
+        if !ok {
+            return Err(format!("下载模型文件 {f} 连续 3 次失败：{last_err}"));
+        }
     }
     Ok(dir)
 }
@@ -452,7 +472,7 @@ impl ModelManager {
             if g.0.is_some() && g.1.elapsed() > Duration::from_secs(5 * 60) {
                 g.0 = None; // Drop 卸载模型
                 drop(g);
-                crate::daemon::release_free_memory();
+                crate::sysmem::release_free_memory();
                 println!("[translate] 空闲卸载 NLLB 模型，归还内存");
             }
         });

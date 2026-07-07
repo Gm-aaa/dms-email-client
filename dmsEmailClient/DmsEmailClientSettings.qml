@@ -20,6 +20,10 @@ PluginSettings {
     property int cacheLimit: 50
     // 邮件正文磁盘缓存目录
     property string cacheDir: ""
+    // IMAP 稳态读/写超时（秒，存于 config.toml，影响守护进程）
+    property int imapTimeout: 60
+    // 正文磁盘缓存最多文件数（存于 config.toml）
+    property int bodyCacheLimit: 500
 
     Component.onCompleted: {
         loadProcess.running = true;
@@ -38,6 +42,8 @@ PluginSettings {
                     root.accounts = data.accounts || [];
                     root.cacheLimit = (data.cache_limit !== undefined) ? data.cache_limit : 50;
                     root.cacheDir = data.cache_dir || "";
+                    root.imapTimeout = (data.imap_timeout_secs !== undefined) ? data.imap_timeout_secs : 60;
+                    root.bodyCacheLimit = (data.body_cache_limit !== undefined) ? data.body_cache_limit : 500;
                 } catch(e) {
                     root.accounts = [];
                 }
@@ -57,7 +63,13 @@ PluginSettings {
     }
 
     function saveAccounts() {
-        let json = JSON.stringify({ cache_limit: root.cacheLimit, cache_dir: root.cacheDir, accounts: root.accounts });
+        let json = JSON.stringify({
+            cache_limit: root.cacheLimit,
+            cache_dir: root.cacheDir,
+            imap_timeout_secs: root.imapTimeout,
+            body_cache_limit: root.bodyCacheLimit,
+            accounts: root.accounts
+        });
         saveProcess.payload = json;
         saveProcess.running = true;
     }
@@ -163,14 +175,14 @@ PluginSettings {
         spacing: Theme.spacingS
 
         StyledText {
-            text: "本地缓存上限"
+            text: "邮件列表容量"
             font.pixelSize: Theme.fontSizeMedium
             font.weight: Font.Medium
             color: Theme.surfaceText
         }
         StyledText {
             width: parent.width
-            text: "缓存的未读邮件总数上限，在已启用账户间平均分配（如 2 个账户 + 60 = 每个 30）"
+            text: "守护进程为每个账户追踪的最近邮件数（仅表头：发件人/主题/日期/已读状态），决定列表最多能有多少封。在已启用账户间平均分配（如 2 个账户 + 60 = 每个 30）。与磁盘上的正文缓存无关。"
             font.pixelSize: Theme.fontSizeSmall
             color: Theme.surfaceVariantText
             wrapMode: Text.WordWrap
@@ -197,14 +209,14 @@ PluginSettings {
         spacing: Theme.spacingS
 
         StyledText {
-            text: "缓存目录"
+            text: "正文缓存目录"
             font.pixelSize: Theme.fontSizeMedium
             font.weight: Font.Medium
             color: Theme.surfaceText
         }
         StyledText {
             width: parent.width
-            text: "邮件正文的磁盘缓存目录（已打开过的邮件再次查看时直接读本地，不再联网）"
+            text: "打开过的邮件正文全文的磁盘缓存目录（再次查看时直接读本地，不再联网）。缓存文件数由下方「正文缓存上限」控制。"
             font.pixelSize: Theme.fontSizeSmall
             color: Theme.surfaceVariantText
             wrapMode: Text.WordWrap
@@ -218,6 +230,84 @@ PluginSettings {
                 let v = text.trim();
                 if (v !== root.cacheDir) {
                     root.cacheDir = v;
+                    root.saveAccounts();
+                }
+            }
+        }
+    }
+
+    // ── 高级 / 网络 ──
+    StyledText {
+        width: parent.width
+        text: "高级 / 网络"
+        font.pixelSize: Theme.fontSizeMedium
+        font.weight: Font.Bold
+        color: Theme.surfaceText
+        topPadding: Theme.spacingM
+    }
+
+    // IMAP 稳态读写超时（config.toml，影响守护进程）
+    Column {
+        width: parent.width
+        spacing: Theme.spacingS
+
+        StyledText {
+            text: "IMAP 超时"
+            font.pixelSize: Theme.fontSizeMedium
+            font.weight: Font.Medium
+            color: Theme.surfaceText
+        }
+        StyledText {
+            width: parent.width
+            text: "取邮件/标记已读等操作的读写超时。半死的网络/代理下超过此值即报错重连，避免账户卡住不刷新、取信一直转圈。不影响后台常驻等待新邮件（IDLE）。切换网络频繁可适当调小。"
+            font.pixelSize: Theme.fontSizeSmall
+            color: Theme.surfaceVariantText
+            wrapMode: Text.WordWrap
+        }
+        DankSlider {
+            width: parent.width
+            value: root.imapTimeout
+            minimum: 10
+            maximum: 120
+            unit: "秒"
+            wheelEnabled: false
+            onSliderValueChanged: newValue => {
+                if (newValue !== root.imapTimeout) {
+                    root.imapTimeout = newValue;
+                    root.saveAccounts();
+                }
+            }
+        }
+    }
+
+    // 正文磁盘缓存文件数上限（config.toml）
+    Column {
+        width: parent.width
+        spacing: Theme.spacingS
+
+        StyledText {
+            text: "正文缓存上限"
+            font.pixelSize: Theme.fontSizeMedium
+            font.weight: Font.Medium
+            color: Theme.surfaceText
+        }
+        StyledText {
+            width: parent.width
+            text: "上方「正文缓存目录」里最多保留多少个正文文件，超过后自动删除最旧的，防止磁盘缓存无上限增长。"
+            font.pixelSize: Theme.fontSizeSmall
+            color: Theme.surfaceVariantText
+            wrapMode: Text.WordWrap
+        }
+        DankSlider {
+            width: parent.width
+            value: root.bodyCacheLimit
+            minimum: 50
+            maximum: 2000
+            unit: "个"
+            wheelEnabled: false
+            onSliderValueChanged: newValue => {
+                if (newValue !== root.bodyCacheLimit) {
+                    root.bodyCacheLimit = newValue;
                     root.saveAccounts();
                 }
             }
