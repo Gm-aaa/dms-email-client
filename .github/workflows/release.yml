@@ -1,0 +1,70 @@
+name: Release
+
+# 推送形如 v1.2.3 的 tag 时触发：编译预置二进制并创建 GitHub Release。
+# 发布流程见 README「发布流程」一节。
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write # 创建 Release 需要写权限
+
+jobs:
+  build-release:
+    name: 构建并发布 (x86_64-linux)
+    # 用较旧的 ubuntu 以获得更宽松的 glibc 兼容性（新系统能向下兼容）
+    runs-on: ubuntu-22.04
+    env:
+      # 覆盖仓库里可能存在的本机 target-dir 设置，产物路径固定为 target/release
+      CARGO_TARGET_DIR: target
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装构建依赖 (ct2rs 需 cmake/g++；native-tls 需 openssl)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake g++ pkg-config libssl-dev
+
+      - name: 安装 Rust 工具链
+        run: rustup toolchain install stable --profile minimal
+
+      - name: 缓存 cargo 依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: 编译 release
+        run: cargo build --release --locked
+
+      - name: 准备发布产物
+        run: |
+          mkdir -p dist
+          cp target/release/dms-email-client dist/dms-email-client-x86_64-linux
+
+      - name: 从 CHANGELOG 提取本版本说明
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # 抽取 "## [<version>]" 到下一个 "## [" 之间的内容作为 Release 说明
+          awk -v v="$version" '
+            $0 ~ ("^## \\[" v "\\]") { flag=1; next }
+            flag && /^## \[/ { flag=0 }
+            flag { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "本次发布无 CHANGELOG 条目，详见 CHANGELOG.md。" > release-notes.md
+          fi
+          echo "----- release notes -----"; cat release-notes.md
+
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/dms-email-client-x86_64-linux \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md

@@ -1,3 +1,5 @@
 /target
 /dms-email-client
 *.sock
+# 本机专用的 cargo 覆盖（如自定义 target-dir），不应进库/CI
+/.cargo/

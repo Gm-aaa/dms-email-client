@@ -111,40 +111,50 @@ enabled = true
 
 ## 编译与安装
 
-### 1. 编译后端程序
-请确保系统已安装：
-- **Rust 编译工具链**（`cargo`）；
-- **C++ 编译工具链 + `cmake`**（如 `gcc`/`g++`、`cmake`）——翻译功能依赖的 `ct2rs` 会在构建时从源码编译内置的 CTranslate2，缺少它们 `cargo build` 会失败；也因此首次全新构建耗时明显更长。
+### 快速安装（推荐）
 
-在项目根目录下执行：
+克隆仓库后运行安装脚本。它默认从 GitHub 最新 Release **下载预编译二进制**（无需 Rust/cmake），
+并把插件文件复制到 DMS 插件目录：
 
 ```bash
-cargo build --release
+git clone https://github.com/Gm-aaa/dms-email-client.git
+cd dms-email-client
+./install.sh
 ```
 
-编译生成的可执行二进制文件位于 `target/release/dms-email-client`。
+- 二进制安装到 `~/.local/bin/dms-email-client`（请确保它在 `PATH` 中）；
+- 插件复制到 `~/.local/share/dms/plugins/dmsEmailClient/`。
 
-将二进制安装到 `PATH` 中（QML 插件默认按名字 `dms-email-client` 查找，无需硬编码路径）：
+安装位置可用环境变量覆盖，例如 `DMS_EMAIL_BIN_DIR`、`DMS_EMAIL_PLUGIN_DIR`（详见 `./install.sh --help`）。
+
+装好后在 DankMaterialShell 中启用 **DMS Email Client** 插件即可（守护进程随插件启用自动启动）。
+
+**卸载**：
 
 ```bash
-# 方式一：装到用户目录（确保 ~/.local/bin 在 PATH 中）
+./uninstall.sh            # 移除二进制与插件（保留配置/缓存）
+./uninstall.sh --purge    # 另外删除配置、正文缓存、离线翻译模型
+```
+
+### 从源码编译安装
+
+若没有对应平台的 Release，或想自行编译，给安装脚本加 `--build`（需 **Rust 工具链** +
+**C++ 工具链与 `cmake`**，因为 `ct2rs` 会在构建时从源码编译内置的 CTranslate2，首次构建较慢）：
+
+```bash
+./install.sh --build
+```
+
+也可以手动编译、自行放置：
+
+```bash
+cargo build --release          # 产物在 target/release/dms-email-client
 install -Dm755 target/release/dms-email-client ~/.local/bin/dms-email-client
-
-# 方式二：用 cargo 安装到 ~/.cargo/bin
-cargo install --path .
-
-# 方式三：系统级安装（需 root）
-sudo install -m755 target/release/dms-email-client /usr/local/bin/dms-email-client
+cp dmsEmailClient/plugin.json dmsEmailClient/*.qml ~/.local/share/dms/plugins/dmsEmailClient/
 ```
 
-> 如果你不想把二进制放进 `PATH`，也可以把 `DmsEmailClientWidget.qml` 与 `DmsEmailClientSettings.qml` 顶部的 `binPath` 改为二进制的绝对路径。
-
-### 2. 安装 DMS 插件
-将 `dmsEmailClient` 目录复制或符号链接到 DankMaterialShell 的插件目录中。例如：
-
-```bash
-ln -s /absolute/path/to/dms-email-client/dmsEmailClient ~/.local/share/dms/plugins/dmsEmailClient
-```
+> 若不想把二进制放进 `PATH`，可把 `DmsEmailClientWidget.qml` 与 `DmsEmailClientSettings.qml`
+> 顶部的 `binPath` 改为二进制的绝对路径。
 
 ---
 
@@ -232,6 +242,30 @@ ln -s /absolute/path/to/dms-email-client/dmsEmailClient ~/.local/share/dms/plugi
 - `reload` / `shutdown` -> 关闭守护进程。
 
 ---
+
+## 版本与更新日志
+
+所有值得注意的改动记录在 [CHANGELOG.md](CHANGELOG.md)（[Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式，
+[语义化版本](https://semver.org/lang/zh-CN/)）。`Cargo.toml`、`plugin.json` 与发布 tag 三者版本保持一致。
+
+## 发布流程
+
+发布由 GitHub Actions 自动完成（见 [`.github/workflows/release.yml`](.github/workflows/release.yml)）。维护者发版步骤：
+
+1. 在 `CHANGELOG.md` 顶部把 `## [Unreleased]` 下的改动整理进新版本段落，例如 `## [0.3.0] - YYYY-MM-DD`；
+2. 同步更新 `Cargo.toml` 与 `dmsEmailClient/plugin.json` 的 `version`（三者一致），并 `cargo build` 刷新 `Cargo.lock`；
+3. 提交后打 tag 并推送：
+
+   ```bash
+   git tag v0.3.0
+   git push origin v0.3.0
+   ```
+
+4. 工作流会在 `ubuntu-22.04` 上编译，产出 `dms-email-client-x86_64-linux`，并以该 tag 创建 Release，
+   Release 说明自动取自 CHANGELOG 中对应版本段落。
+
+> 预编译二进制面向 x86_64 Linux（glibc，基于 ubuntu-22.04 构建以兼顾较旧系统），动态链接系统 OpenSSL。
+> 使用 musl 或过旧 glibc 的系统请改用 `./install.sh --build` 从源码编译。
 
 ## 许可证
 
