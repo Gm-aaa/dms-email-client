@@ -43,6 +43,9 @@ pub fn run_daemon(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let body_cache_limit = config.body_cache_limit;
     // IMAP 稳态读/写超时（最小 5 秒，防误配成 0 把连接秒断）
     let io_timeout = Duration::from_secs(config.imap_timeout_secs.max(5));
+    // IDLE 轮询间隔（兼作弱 IDLE 服务商的兜底 + 代理长连接保活）。
+    // 下限 15 秒防过度频繁拉取，上限 29 分钟遵循 RFC 2177 的 IDLE 重发建议。
+    let idle_poll = Duration::from_secs(config.poll_interval_secs.clamp(15, 29 * 60));
     // 保留账户列表供按需操作（取正文 / 标记已读）使用
     let accounts: Arc<Vec<Account>> = Arc::new(config.accounts.clone());
     let state = Arc::new(RwLock::new(DaemonState::default()));
@@ -55,7 +58,7 @@ pub fn run_daemon(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
         let state_clone = Arc::clone(&state);
         thread::spawn(move || {
-            imap_sync::run_account_loop(account, state_clone, per_account_limit, io_timeout);
+            imap_sync::run_account_loop(account, state_clone, per_account_limit, io_timeout, idle_poll);
         });
     }
 

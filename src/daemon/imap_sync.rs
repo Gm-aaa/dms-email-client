@@ -191,6 +191,7 @@ pub fn run_account_loop(
     state: Arc<RwLock<DaemonState>>,
     per_account_limit: usize,
     io_timeout: Duration,
+    idle_poll: Duration,
 ) {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     let retry_delay = Duration::from_secs(10);
@@ -200,7 +201,7 @@ pub fn run_account_loop(
         // catch_unwind 兜底：一旦 connect_and_idle 内部 panic（而非返回 Err），
         // 也把该账户线程救回来重连，而不是让线程静默死掉、此后永不刷新。
         let outcome =
-            catch_unwind(AssertUnwindSafe(|| connect_and_idle(&account, &state, per_account_limit, io_timeout)));
+            catch_unwind(AssertUnwindSafe(|| connect_and_idle(&account, &state, per_account_limit, io_timeout, idle_poll)));
         match outcome {
             Ok(Ok(())) => {
                 println!("[{}] 连接正常关闭，10 秒后重连...", account.name);
@@ -227,6 +228,7 @@ fn connect_and_idle(
     state: &Arc<RwLock<DaemonState>>,
     per_account_limit: usize,
     io_timeout: Duration,
+    idle_poll: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut imap_session, tcp_ctl) = connect_session(account, io_timeout)?;
 
@@ -248,7 +250,7 @@ fn connect_and_idle(
 
     loop {
         // 每轮 fetch 前把读超时复位到 io_timeout：上一轮的 IDLE(wait_with_timeout) 会把
-        // socket 读超时改成 5 分钟，这里复位以确保 examine/uid_fetch 受 io_timeout 保护。
+        // socket 读超时改成 idle_poll，这里复位以确保 examine/uid_fetch 受 io_timeout 保护。
         tcp_ctl.set_read_timeout(Some(io_timeout))?;
 
         let mut account_mails: Vec<MailInfo> = Vec::new();
@@ -429,11 +431,14 @@ fn connect_and_idle(
         known = current;
         is_first_sync = false;
 
-        // 在 INBOX 上 IDLE；超时设短（5 分钟），以便周期性复查垃圾邮件等其他文件夹
+        // 在 INBOX 上 IDLE，至多 idle_poll 就主动醒来重拉一遍。这既能周期性复查垃圾邮件
+        // 等其他文件夹，更重要的是兜住「IDLE 不推送 / 代理长连接被静默回收」的服务商
+        // （见 poll_interval_secs 说明）：新邮件最坏延迟 ≈ idle_poll，而非依赖 EXISTS 推送。
+        // EXISTS 一旦到达，wait_with_timeout 会在超时前提早返回，仍是近实时。
         imap_session.examine("INBOX")?;
-        println!("[{}] 进入 IDLE 等待新邮件...", account.name);
+        println!("[{}] 进入 IDLE 等待新邮件（至多 {} 秒）...", account.name, idle_poll.as_secs());
         let handle = imap_session.idle()?;
-        handle.wait_with_timeout(Duration::from_secs(5 * 60))?;
+        handle.wait_with_timeout(idle_poll)?;
         println!("[{}] IDLE 唤醒，正在检查更新...", account.name);
     }
 }
