@@ -247,6 +247,9 @@ fn connect_and_idle(
     // UIDVALIDITY 变化则清掉该文件夹缓存（UID 语义已失效，必须重取）。
     let mut hdr_cache: HashMap<(String, u32), (String, String, String)> = HashMap::new();
     let mut uidvalidity: HashMap<String, u32> = HashMap::new();
+    // 廉价变更检测签名：按 folder 记上一轮 examine 返回的 (UIDNEXT, EXISTS)。两者都没变
+    // 说明无邮件增删，可跳过随邮箱总量线性增长的全量 uid_search("ALL") 与头部抓取。
+    let mut folder_sig: HashMap<String, (u32, u32)> = HashMap::new();
 
     loop {
         // 每轮 fetch 前把读超时复位到 io_timeout：上一轮的 IDLE(wait_with_timeout) 会把
@@ -257,7 +260,8 @@ fn connect_and_idle(
         let mut current: HashSet<String> = HashSet::new();
 
         for folder in &folders {
-            // 只读打开该文件夹（examine 不会标记已读），并读取 UIDVALIDITY
+            // 只读打开该文件夹（examine 不会标记已读）。其响应免费带回 UIDVALIDITY /
+            // UIDNEXT / EXISTS —— 后两者用于下面的廉价变更检测。
             let mailbox = match imap_session.examine(folder) {
                 Ok(mb) => mb,
                 Err(_) => continue,
@@ -267,31 +271,58 @@ fn connect_and_idle(
                 if uidvalidity.get(folder) != Some(&uv) {
                     hdr_cache.retain(|(f, _), _| f != folder);
                     uidvalidity.insert(folder.clone(), uv);
+                    folder_sig.remove(folder);
                 }
             }
 
-            // 取该文件夹最近的若干封邮件（已读 + 未读都要），按 UID 从大到小取前 per_account_limit 封
-            let all_uids = match imap_session.uid_search("ALL") {
-                Ok(set) => set,
-                Err(_) => continue,
-            };
-            if all_uids.is_empty() {
-                // 文件夹已空 → 清掉其缓存
-                hdr_cache.retain(|(f, _), _| f != folder);
-                continue;
-            }
-            let mut uid_vec: Vec<u32> = all_uids.into_iter().collect();
-            uid_vec.sort_unstable_by(|a, b| b.cmp(a));
-            let take = if per_account_limit > 0 {
-                std::cmp::min(per_account_limit, uid_vec.len())
-            } else {
-                uid_vec.len()
-            };
-            uid_vec.truncate(take);
+            // 该文件夹缓存里现有的 UID（即上一轮的 top-N），按 UID 从大到小
+            let mut cached_uids: Vec<u32> = hdr_cache
+                .keys()
+                .filter(|(f, _)| f == folder)
+                .map(|(_, u)| *u)
+                .collect();
+            cached_uids.sort_unstable_by(|a, b| b.cmp(a));
 
-            // 淘汰：窗口滑动 / 已删除 —— 移除不在当前 top-N 里的该文件夹缓存项
-            let keep: HashSet<u32> = uid_vec.iter().copied().collect();
-            hdr_cache.retain(|(f, u), _| f != folder || keep.contains(u));
+            // 廉价变更检测：examine 免费返回的 (UIDNEXT, EXISTS) 与上轮相同、且缓存非空，
+            // 说明无邮件增删（新增会改 UIDNEXT/EXISTS，删除会改 EXISTS）→ 走快路：复用缓存
+            // 的 top-N，跳过随邮箱总量线性增长的 uid_search("ALL") 与头部抓取，稍后仅对这批
+            // UID 取一次 FLAGS 同步已读态。UIDNEXT 缺失（服务器没给）则不敢走快路，照常全量。
+            let sig = mailbox.uid_next.map(|n| (n, mailbox.exists));
+            let fast = sig.is_some() && folder_sig.get(folder) == sig.as_ref() && !cached_uids.is_empty();
+
+            let uid_vec: Vec<u32> = if fast {
+                cached_uids
+            } else {
+                // —— 完整同步：全量取 UID → top-N → 淘汰滑出窗口/已删除的缓存项 ——
+                let all_uids = match imap_session.uid_search("ALL") {
+                    Ok(set) => set,
+                    Err(_) => continue,
+                };
+                if all_uids.is_empty() {
+                    // 文件夹已空 → 清掉其缓存，记签名后跳过
+                    hdr_cache.retain(|(f, _), _| f != folder);
+                    if let Some(s) = sig {
+                        folder_sig.insert(folder.clone(), s);
+                    }
+                    continue;
+                }
+                let mut v: Vec<u32> = all_uids.into_iter().collect();
+                v.sort_unstable_by(|a, b| b.cmp(a));
+                let take = if per_account_limit > 0 {
+                    std::cmp::min(per_account_limit, v.len())
+                } else {
+                    v.len()
+                };
+                v.truncate(take);
+                // 淘汰：窗口滑动 / 已删除 —— 移除不在当前 top-N 里的该文件夹缓存项
+                let keep: HashSet<u32> = v.iter().copied().collect();
+                hdr_cache.retain(|(f, u), _| f != folder || keep.contains(u));
+                // 记录本轮签名，供下一轮廉价检测
+                if let Some(s) = sig {
+                    folder_sig.insert(folder.clone(), s);
+                }
+                v
+            };
 
             // 本轮各 UID 的已读状态（uid -> seen）
             let mut seen_map: HashMap<u32, bool> = HashMap::new();

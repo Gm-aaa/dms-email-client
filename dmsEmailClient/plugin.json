@@ -2,7 +2,7 @@
     "id": "dmsEmailClient",
     "name": "DMS Email Client",
     "description": "High-performance email checker and notifier using Rust",
-    "version": "0.2.1",
+    "version": "0.2.2",
     "author": "gmaaa",
     "icon": "mail",
     "type": "widget",
